@@ -11,6 +11,7 @@ from micam import (
     AUDIO_BURST_GAP,
     AUDIO_GAP_MAX,
     AUDIO_GAP_MIN,
+    AUDIO_RATE_MEASURE_TIMEOUT,
     AUDIO_RATE_MIN_PLAUSIBLE,
     AUDIO_RATE_SAMPLE_FRAMES,
     AUDIO_RECONNECT_DELAY,
@@ -261,26 +262,43 @@ class CadencePlausibilityTest(unittest.TestCase):
     wrong speed, whereas video-only is merely a missing feature."""
 
     def decide(self, gaps, size=640):
-        kept = [g for g in gaps if g >= AUDIO_BURST_GAP]
-        plausible = sorted(g for g in kept if AUDIO_GAP_MIN <= g <= AUDIO_GAP_MAX)
-        if len(plausible) < AUDIO_RATE_MIN_PLAUSIBLE:
+        """Mirror of _measure_rate: only frames at a plausible cadence count, and
+        sampling continues until there are enough of them or time runs out."""
+        good = []
+        elapsed = 0.0
+        for gap in gaps:
+            elapsed += gap
+            if elapsed > AUDIO_RATE_MEASURE_TIMEOUT:
+                break
+            if AUDIO_GAP_MIN <= gap <= AUDIO_GAP_MAX:
+                good.append(gap)
+            if len(good) >= AUDIO_RATE_SAMPLE_FRAMES:
+                break
+        if len(good) < AUDIO_RATE_MIN_PLAUSIBLE:
             return None
+        good.sort()
         return min(AUDIO_RATES,
-                   key=lambda r: abs(r - size / plausible[len(plausible) // 2]))
+                   key=lambda r: abs(r - size / good[len(good) // 2]))
 
     def test_settled_streams_are_measured(self):
-        self.assertEqual(self.decide([0.040] * 50), 16000)
-        self.assertEqual(self.decide([0.080] * 50), 8000)
-        self.assertEqual(self.decide([0.001] * 300 + [0.040] * 50), 16000)
+        self.assertEqual(self.decide([0.040] * 60), 16000)
+        self.assertEqual(self.decide([0.080] * 60), 8000)
+        self.assertEqual(self.decide([0.001] * 300 + [0.040] * 60), 16000)
 
-    def test_reconnect_ramp_is_refused_rather_than_guessed(self):
-        # observed after a stall: frames trickling in at 144ms and 267ms against a
-        # steady 40ms, which read as 8kHz and halved the session's speed
-        self.assertIsNone(self.decide([0.267] * 50))
-        self.assertIsNone(self.decide([0.144] * 50))
+    def test_a_stream_that_never_settles_is_refused(self):
+        # frames trickling at 144ms or 267ms against a steady 40ms read as 8kHz and
+        # halved the session's speed, so they must not be measured
+        self.assertIsNone(self.decide([0.267] * 200))
+        self.assertIsNone(self.decide([0.144] * 200))
+
+    def test_a_slow_start_delays_the_answer_rather_than_denying_it(self):
+        # this shipped as "19 of 50 frames plausible" and dropped a whole session to
+        # video-only, because sampling stopped before enough good frames arrived
+        self.assertEqual(self.decide([0.267] * 31 + [0.040] * 200), 16000)
+        self.assertEqual(self.decide([0.001] * 300 + [0.040] * 200), 16000)
 
     def test_a_ramp_that_settles_is_measured_from_the_settled_part(self):
-        self.assertEqual(self.decide([0.267] * 20 + [0.040] * 30), 16000)
+        self.assertEqual(self.decide([0.267] * 20 + [0.040] * 60), 16000)
 
     def test_both_candidate_cadences_sit_inside_the_band(self):
         for gap in (0.040, 0.080):

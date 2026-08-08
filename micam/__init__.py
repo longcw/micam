@@ -285,12 +285,13 @@ class RTSPBridge:
                 now = loop.time()
                 gap = now - prev if prev is not None else None
                 prev = now
-                # Whatever the server had buffered arrives back to back on connect, so
-                # those frames say nothing about the camera's pace. How many there are
-                # varies, so recognise them by their spacing rather than counting a
-                # fixed number off: real frames are milliseconds apart, buffered ones
-                # microseconds.
-                if gap is None or gap < AUDIO_BURST_GAP:
+                # Only frames arriving at a cadence one of the candidates would keep
+                # count towards the sample. Buffered ones arrive back to back and a
+                # reconnecting stream trickles, and neither says anything about the
+                # camera's pace. Waiting for enough good frames rather than taking
+                # whatever the first fifty happen to be means a slow start delays the
+                # answer instead of denying it.
+                if gap is None or not (AUDIO_GAP_MIN <= gap <= AUDIO_GAP_MAX):
                     continue
                 gaps.append(gap)
                 sizes.append(len(msg.data))
@@ -300,21 +301,12 @@ class RTSPBridge:
             logger.warning("Could not measure the audio rate: %s", e)
             return None
 
-        if not gaps:
-            logger.warning("No audio arrived while measuring its rate")
-            return None
-        # Frames arriving nowhere near either candidate's cadence mean the stream
-        # has not settled — after a reconnect they trickle in at 150-270ms against a
-        # steady 40ms. Reading a rate off that picks the wrong one and plays the whole
-        # session at the wrong speed, so wait for a cadence that makes sense instead.
-        plausible = [g for g in gaps if AUDIO_GAP_MIN <= g <= AUDIO_GAP_MAX]
-        if len(plausible) < AUDIO_RATE_MIN_PLAUSIBLE:
+        if len(gaps) < AUDIO_RATE_MIN_PLAUSIBLE:
             logger.warning(
-                "Audio cadence never settled (%d of %d frames plausible); "
+                "Audio never settled into a steady cadence (%d usable frames in %.0fs); "
                 "publishing video only this session",
-                len(plausible), len(gaps))
+                len(gaps), AUDIO_RATE_MEASURE_TIMEOUT)
             return None
-        gaps = plausible
         # Take the typical gap between frames rather than an average over a window.
         # A window is at the mercy of whatever happens to fall inside it: one quiet
         # patch once read as 276 bytes/s, which snapped to 8 kHz and played that whole

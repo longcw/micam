@@ -101,5 +101,28 @@ class EnableAudioTest(unittest.TestCase):
         self.assertFalse(build_bridge(enable_audio=False).enable_audio)
 
 
+class AudioFailureTest(unittest.TestCase):
+    def test_audio_loss_terminates_ffmpeg(self):
+        # ffmpeg cannot withdraw an announced audio track, so losing audio has to
+        # restart the bridge rather than publish a track that never carries data
+        bridge = build_bridge()
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        bridge.process = proc
+        bridge._terminate_ffmpeg()
+        proc.terminate.assert_called_once()
+
+    def test_already_exited_ffmpeg_is_left_alone(self):
+        bridge = build_bridge()
+        proc = mock.Mock()
+        proc.poll.return_value = 0
+        bridge.process = proc
+        bridge._terminate_ffmpeg()
+        proc.terminate.assert_not_called()
+
+    def test_orderly_shutdown_flag_defaults_off(self):
+        self.assertFalse(build_bridge()._shutting_down)
+
+
 if __name__ == "__main__":
     unittest.main()

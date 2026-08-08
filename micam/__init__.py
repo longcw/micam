@@ -52,6 +52,9 @@ class RTSPBridge:
         self.audio_fd: Optional[int] = None
         # audio is held back until video starts, so both inputs share a wallclock origin
         self.video_started = asyncio.Event()
+        # set once the video loop is tearing down, so a shutting-down audio task
+        # does not mistake an orderly stop for an audio failure
+        self._shutting_down = False
 
     async def _login(self) -> bool:
         """Login and retrieve access token."""
@@ -145,6 +148,16 @@ class RTSPBridge:
             pass
         self.audio_fd = None
 
+    def _terminate_ffmpeg(self):
+        """Signal FFmpeg to exit, leaving the process handle for the caller to reap."""
+        proc = self.process
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+
     def _stop_ffmpeg(self):
         """Stop FFmpeg process."""
         self._close_audio_fd()
@@ -219,10 +232,17 @@ class RTSPBridge:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            # audio is best effort, never take the video stream down with it
             logger.error("Audio streaming stopped: %s", e)
         finally:
             self._close_audio_fd()
+            # FFmpeg already announced an audio track to the RTSP server, and that
+            # announcement cannot be withdrawn on a live session. Carrying on with
+            # video would publish a stream advertising audio that never arrives,
+            # which stalls consumers waiting on it. Restart the bridge instead, so
+            # the next session either carries audio or honestly has none.
+            if not self._shutting_down:
+                logger.warning("Audio stream ended; restarting the bridge without a stale audio track")
+                self._terminate_ffmpeg()
 
     async def run(self):
         """Main loop to connect to WebSocket and pipe data."""
@@ -288,6 +308,7 @@ class RTSPBridge:
             except Exception as e:
                 logger.error(f"Streaming error", exc_info=True)
             finally:
+                self._shutting_down = True
                 self.video_started.set()
                 if audio_task:
                     audio_task.cancel()

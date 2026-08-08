@@ -47,6 +47,11 @@ AUDIO_SILENCE = {"alaw": b"\xd5", "mulaw": b"\xff"}
 # dead server from being hammered.
 AUDIO_RECONNECT_DELAY = 0.5
 
+# Longest we wait for the audio task to stop during teardown. Exceeding it means a
+# worker thread is still stuck, and the bridge is better off exiting so the restart
+# policy can bring it back than hanging on forever.
+SHUTDOWN_TIMEOUT = 10.0
+
 # How long audio may stay down before the bridge restarts rather than keep
 # advertising a track it cannot deliver.
 AUDIO_GIVEUP_SECONDS = 60.0
@@ -188,8 +193,13 @@ class RTSPBridge:
             pass
 
     def _stop_ffmpeg(self):
-        """Stop FFmpeg process."""
-        self._close_audio_fd()
+        """Stop FFmpeg, then release the audio pipe.
+
+        FFmpeg goes first on purpose. A writer parked in a blocking ``os.write``
+        on a full pipe only comes back when the read end goes away, and that
+        writer runs in a worker thread, which cannot be cancelled — closing our
+        own end would leave it stuck.
+        """
         if self.process:
             if self.process.poll() is None:
                 self.process.terminate()
@@ -197,7 +207,12 @@ class RTSPBridge:
                     self.process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     self.process.kill()
+                    try:
+                        self.process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        logger.error("FFmpeg ignored SIGKILL")
             self.process = None
+        self._close_audio_fd()
 
     async def _measure_rate(self, ws) -> Optional[int]:
         """Work out the sample rate by timing the frames the camera actually sends.
@@ -468,12 +483,21 @@ class RTSPBridge:
             finally:
                 self._shutting_down = True
                 self.video_started.set()
+                # Tear FFmpeg down before waiting on the audio task. That task can
+                # be parked in a blocking write on a full pipe, which no amount of
+                # cancelling will interrupt; killing the reader is what frees it.
+                # Waiting first hung the process here, so it never exited and the
+                # restart policy never fired — the stream stayed dead until a
+                # manual restart.
+                self._stop_ffmpeg()
                 if audio_task:
                     audio_task.cancel()
-                    await asyncio.gather(audio_task, return_exceptions=True)
-                if audio_ws:
+                    done, pending = await asyncio.wait(
+                        {audio_task}, timeout=SHUTDOWN_TIMEOUT)
+                    if pending:
+                        logger.error("Audio task did not stop; exiting anyway")
+                if audio_ws and not audio_ws.closed:
                     await audio_ws.close()
-                self._stop_ffmpeg()
                 logger.info("Stream finished")
 
     def _is_keyframe(self, data: bytes) -> bool:
@@ -575,6 +599,13 @@ def main():
         asyncio.run(bridge.run())
     except KeyboardInterrupt:
         logger.info("Stopped by user")
+    finally:
+        # A worker thread still parked in a blocking write would keep the
+        # interpreter alive through executor shutdown, so the process would never
+        # exit and the restart policy would never bring the stream back. There is
+        # no state worth unwinding here, so leave immediately.
+        logging.shutdown()
+        os._exit(0)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from micam import (
     AUDIO_RATE_WARMUP_SECONDS,
     AUDIO_RECONNECT_DELAY,
     AUDIO_SILENCE,
+    SHUTDOWN_TIMEOUT,
     RTSPBridge,
 )
 
@@ -188,6 +189,26 @@ class RateDetectionTest(unittest.TestCase):
         # cameras at half speed and starved the pipe
         for value in AUDIO_INPUTS.values():
             self.assertEqual(len(value), 2)
+
+
+class TeardownOrderTest(unittest.TestCase):
+    def test_ffmpeg_is_killed_before_the_audio_pipe_is_closed(self):
+        # a writer parked in a blocking os.write only returns when the read end
+        # goes away, and that write runs in a thread that cannot be cancelled
+        bridge = build_bridge()
+        order = []
+        proc = mock.Mock()
+        proc.poll.side_effect = [None, 0]
+        proc.terminate.side_effect = lambda: order.append("kill_ffmpeg")
+        bridge.process = proc
+        bridge.audio_fd = 9
+        with mock.patch("os.close", side_effect=lambda fd: order.append("close_pipe")):
+            bridge._stop_ffmpeg()
+        self.assertEqual(order, ["kill_ffmpeg", "close_pipe"])
+
+    def test_shutdown_wait_is_bounded(self):
+        self.assertGreater(SHUTDOWN_TIMEOUT, 0)
+        self.assertLessEqual(SHUTDOWN_TIMEOUT, 30)
 
 
 if __name__ == "__main__":

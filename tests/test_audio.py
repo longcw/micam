@@ -74,6 +74,16 @@ class StartFfmpegTest(unittest.TestCase):
         # -map 0:v / -map 1:a rely on this order
         self.assertLess(cmd.index("pipe:0"), cmd.index("pipe:7"))
 
+    def test_interleave_wait_is_disabled_when_audio_is_present(self):
+        # otherwise the muxer holds video until audio catches up, and audio
+        # arriving at exactly real time can never close a gap once one opens
+        cmd, _ = self.start(build_bridge(), audio_input(1027))
+        self.assertEqual(cmd[cmd.index("-max_interleave_delta") + 1], "0")
+
+    def test_no_interleave_flag_without_audio(self):
+        cmd, _ = self.start(build_bridge(), None)
+        self.assertNotIn("-max_interleave_delta", cmd)
+
     def test_only_video_is_stamped_from_the_wallclock(self):
         cmd, _ = self.start(build_bridge(), audio_input(1027))
         # stamping raw PCM by arrival time compresses bursts and runs audio ahead of video

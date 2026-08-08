@@ -149,11 +149,22 @@ class RTSPBridge:
             # no wallclock stamping here: raw PCM carries its own timing through the sample
             # rate, and stamping by arrival bunches bursts into too short a span
             ffmpeg_cmd += [
+                # room to absorb websocket jitter, so a late frame does not
+                # immediately starve the muxer
+                '-thread_queue_size', '512',
                 '-f', audio_format,
                 '-ar', str(sample_rate),
                 '-ac', str(channels),
                 '-i', f'pipe:{read_fd}',
             ]
+
+        if audio_input:
+            # Without this the muxer holds video back until audio reaches the same
+            # timestamp. Audio arrives at exactly real time, so it can never close a
+            # gap once one opens, and video queues up until the write into FFmpeg
+            # blocks and the bridge has to be restarted. Zero tells it to write
+            # packets as they arrive instead of waiting to interleave them.
+            ffmpeg_cmd += ['-max_interleave_delta', '0']
 
         ffmpeg_cmd += ['-map', '0:v', '-c:v', 'copy']  # Copy video stream
         if audio_input:

@@ -1,0 +1,40 @@
+--- a/miloco_server/proxy/miot_proxy.py
++++ b/miloco_server/proxy/miot_proxy.py
+@@ -172,6 +172,37 @@
+             raise
+ 
+ 
++    async def start_camera_raw_audio_stream(self, camera_id: str, channel: int,
++                                    callback: Callable[[str, bytes, int, int, int, int], Coroutine]):
++        if camera_id not in self._camera_img_managers:
++            logger.warning("Camera %s not found in managers", camera_id)
++            return
++        instance = self._camera_img_managers[camera_id]
++        await instance.register_raw_audio_stream(callback, channel)
++        logger.info("Successfully started camera raw audio stream, camera_id: %s, channel: %s", camera_id, channel)
++
++
++    async def stop_camera_raw_audio_stream(self, camera_id: str, channel: int):
++        """
++        Stop camera raw audio stream
++
++        Args:
++            camera_id: Camera device ID
++            channel: Channel number, default is 0
++        """
++        if camera_id not in self._camera_img_managers:
++            logger.warning("Camera %s not found in managers", camera_id)
++            return
++
++        instance = self._camera_img_managers[camera_id]
++        try:
++            await instance.unregister_raw_audio_stream(channel)
++            logger.info("Successfully stopped camera raw audio stream, camera_id: %s, channel: %s", camera_id, channel)
++        except Exception as e: # pylint: disable=broad-exception-caught
++            logger.error("Failed to stop camera raw audio stream: %s", e)
++            raise
++
++
+     async def _create_camera_img_manager(self, camera_info: MIoTCameraInfo) -> CameraVisionHandler | None:
+         camera_instance = await self._get_camera_instance(camera_info)
+         if camera_instance is not None:

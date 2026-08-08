@@ -1,0 +1,57 @@
+--- a/miot_kit/miot/camera.py
++++ b/miot_kit/miot/camera.py
+@@ -299,6 +299,30 @@
+     async def unregister_raw_audio_async(self, channel: int = 0, reg_id: int = 0) -> None:
+         """Unregister camera raw audio callback."""
+         reg_key: str = f"raw_audio.{channel}"
++        if reg_key not in self._callbacks:
++            return
++        self._callbacks[reg_key].pop(str(reg_id), None)
++        await self.__update_raw_data_register_status_async(channel=channel, is_register=False)
++
++    async def register_raw_audio_ex_async(
++        self, callback: Callable[[str, bytes, int, int, int, int], Coroutine], channel: int = 0,
++        multi_reg: bool = False
++    ) -> int:
++        """Register camera raw audio callback that also receives the codec id.
++        async def on_raw_audio_ex_async(did: str, data: bytes, ts: int, seq: int, channel: int, codec_id: int)
++        """
++        await self.__update_raw_data_register_status_async(channel=channel)
++        reg_key: str = f"raw_audio_ex.{channel}"
++        self._callbacks.setdefault(reg_key, {})
++        reg_id: int = 0
++        if multi_reg:
++            reg_id = len(self._callbacks) + 1
++        self._callbacks[reg_key][str(reg_id)] = callback
++        return reg_id
++
++    async def unregister_raw_audio_ex_async(self, channel: int = 0, reg_id: int = 0) -> None:
++        """Unregister camera raw audio codec-aware callback."""
++        reg_key: str = f"raw_audio_ex.{channel}"
+         if reg_key not in self._callbacks:
+             return
+         self._callbacks[reg_key].pop(str(reg_id), None)
+@@ -382,6 +406,8 @@
+             if len(self._callbacks.get(f"raw_video.{channel}", {})) > 0:
+                 need_unreg = False
+             if len(self._callbacks.get(f"raw_audio.{channel}", {})) > 0:
++                need_unreg = False
++            if len(self._callbacks.get(f"raw_audio_ex.{channel}", {})) > 0:
+                 need_unreg = False
+             if len(self._callbacks.get(f"decode_jpg.{channel}", {})) > 0:
+                 need_unreg = False
+@@ -475,6 +501,14 @@
+             for a_callback in list(a_callbacks.values()):
+                 asyncio.run_coroutine_threadsafe(
+                     a_callback(self._did, frame_data.data, frame_data.timestamp, frame_data.sequence, channel),
++                    self._main_loop
++                )
++            # the codec travels with the frame, since dispatch is deferred onto the loop
++            ax_callbacks = self._callbacks.get(f"raw_audio_ex.{channel}", {})
++            for ax_callback in list(ax_callbacks.values()):
++                asyncio.run_coroutine_threadsafe(
++                    ax_callback(
++                        self._did, frame_data.data, frame_data.timestamp, frame_data.sequence, channel, int(codec_id)),
+                     self._main_loop
+                 )
+         else:

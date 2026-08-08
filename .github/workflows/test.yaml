@@ -1,0 +1,40 @@
+name: Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Run unit tests
+        run: uv run python -m unittest discover -s . -p "test_*.py" -v
+
+      - name: Check patches apply to the pinned miloco image
+        run: |
+          base=$(grep -oE 'ghcr\.io/miiot/miloco@sha256:[0-9a-f]+' Dockerfile.miloco-audio | head -1)
+          echo "base image: $base"
+          docker create --name miloco-base "$base"
+          for f in miot_kit/miot/camera.py \
+                   miloco_server/controller/miot_controller.py \
+                   miloco_server/service/miot_service.py \
+                   miloco_server/proxy/miot_proxy.py \
+                   miloco_server/utils/carmera_vision_handler.py; do
+            mkdir -p "work/$(dirname "$f")"
+            docker cp "miloco-base:/app/$f" "work/$f"
+          done
+          docker rm miloco-base
+          cd work
+          for p in ../patches/miloco/*.patch; do
+            echo "checking $(basename "$p")"
+            patch -p1 -F0 --dry-run < "$p"
+          done

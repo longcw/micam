@@ -1,0 +1,51 @@
+--- a/miloco_server/service/miot_service.py
++++ b/miloco_server/service/miot_service.py
+@@ -333,7 +333,48 @@
+         except Exception as e:
+             logger.error("Failed to stop video stream: %s", e)
+             raise MiotServiceException(f"Failed to stop video stream: {str(e)}") from e
++
++    async def start_audio_stream(self, camera_id: str, channel: int, callback):
++        """
++        Start audio stream (business layer method)
++
++        Args:
++            camera_id: Camera device ID
++            channel: Channel number
++            callback: Audio data callback function
+ 
++        Raises:
++            MiotServiceException: When startup fails
++        """
++        try:
++            logger.info("Starting audio stream: camera_id=%s, channel=%s", camera_id, channel)
++            if callback:
++                await self._miot_proxy.start_camera_raw_audio_stream(
++                    camera_id, channel, callback)
++            else:
++                logger.info("No callback function, only recording startup request: camera_id=%s", camera_id)
++        except Exception as e:
++            logger.error("Failed to start audio stream: %s", e)
++            raise MiotServiceException(f"Failed to start audio stream: {str(e)}") from e
++
++    async def stop_audio_stream(self, camera_id: str, channel: int):
++        """
++        Stop audio stream (business layer method)
++
++        Args:
++            camera_id: Camera device ID
++
++        Raises:
++            MiotServiceException: When stopping fails
++        """
++        try:
++            logger.info("Stopping audio stream: camera_id=%s", camera_id)
++            await self._miot_proxy.stop_camera_raw_audio_stream(camera_id, channel)
++            logger.info("Audio stream stopped successfully: camera_id=%s", camera_id)
++        except Exception as e:
++            logger.error("Failed to stop audio stream: %s", e)
++            raise MiotServiceException(f"Failed to stop audio stream: {str(e)}") from e
++
+     async def get_miot_scene_actions(self) -> List[Action]:
+         """
+         Get MiOT scene action list

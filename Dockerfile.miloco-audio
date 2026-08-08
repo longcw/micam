@@ -1,0 +1,53 @@
+# Miloco with audio streaming exposed over a websocket.
+#
+# Miloco already pulls audio from the camera (miiot's build turns on enable_audio),
+# but the server never forwards it, so the RTSP bridge only ever sees video. The
+# patches here add a /api/miot/ws/audio_stream endpoint alongside the video one.
+#
+# The base is pinned by digest because upstream restructured the miloco source tree
+# and rewrote history, so the layout these patches target is no longer buildable from
+# source. Bump MILOCO_BASE deliberately; the patcher stage fails the build if the
+# files have moved underneath us.
+
+ARG MILOCO_BASE=ghcr.io/miiot/miloco@sha256:cfe5bc4b6302e306a6eb61b0b40e14d4e9e6e9fe6a79c3fe9578816af7c85078
+
+FROM ${MILOCO_BASE} AS source
+
+
+################################################
+# Patcher
+################################################
+FROM alpine:3.20 AS patcher
+
+RUN apk add --no-cache patch
+
+COPY --from=source /app/miot_kit/miot/camera.py /work/miot_kit/miot/camera.py
+COPY --from=source /app/miloco_server/controller/miot_controller.py /work/miloco_server/controller/miot_controller.py
+COPY --from=source /app/miloco_server/service/miot_service.py /work/miloco_server/service/miot_service.py
+COPY --from=source /app/miloco_server/proxy/miot_proxy.py /work/miloco_server/proxy/miot_proxy.py
+COPY --from=source /app/miloco_server/utils/carmera_vision_handler.py /work/miloco_server/utils/carmera_vision_handler.py
+
+COPY patches/miloco /patches
+
+# no fuzz and no offsets: a patch that does not apply exactly means the base moved
+RUN set -eux; \
+    cd /work; \
+    for p in /patches/*.patch; do \
+        echo "applying $(basename "$p")"; \
+        patch -p1 -F0 --no-backup-if-mismatch < "$p"; \
+    done
+
+
+################################################
+# Runtime
+################################################
+FROM ${MILOCO_BASE}
+
+COPY --from=patcher /work/miot_kit/miot/camera.py /app/miot_kit/miot/camera.py
+COPY --from=patcher /work/miloco_server/controller/miot_controller.py /app/miloco_server/controller/miot_controller.py
+COPY --from=patcher /work/miloco_server/service/miot_service.py /app/miloco_server/service/miot_service.py
+COPY --from=patcher /work/miloco_server/proxy/miot_proxy.py /app/miloco_server/proxy/miot_proxy.py
+COPY --from=patcher /work/miloco_server/utils/carmera_vision_handler.py /app/miloco_server/utils/carmera_vision_handler.py
+
+# drop bytecode cached from the unpatched sources
+RUN find /app/miot_kit /app/miloco_server -name '__pycache__' -type d -exec rm -rf {} + || true

@@ -7,8 +7,8 @@ from micam import (
     AUDIO_GIVEUP_SECONDS,
     AUDIO_INPUTS,
     AUDIO_RATES,
-    AUDIO_RATE_SAMPLE_SECONDS,
-    AUDIO_RATE_WARMUP_SECONDS,
+    AUDIO_RATE_SAMPLE_FRAMES,
+    AUDIO_RATE_SKIP_FRAMES,
     AUDIO_RECONNECT_DELAY,
     AUDIO_SILENCE,
     SHUTDOWN_TIMEOUT,
@@ -186,14 +186,33 @@ class RateDetectionTest(unittest.TestCase):
             got = min(AUDIO_RATES, key=lambda r: abs(r - measured))
             self.assertEqual(got, expected, f"{measured} -> {got}")
 
-    def test_warmup_precedes_measurement(self):
-        # the server flushes its buffer on connect much faster than real time, and
-        # timing that burst reads as roughly double the real rate
-        self.assertGreater(AUDIO_RATE_WARMUP_SECONDS, 0)
+    def test_connect_burst_is_skipped(self):
+        # the server flushes its buffer on connect much faster than real time
+        self.assertGreater(AUDIO_RATE_SKIP_FRAMES, 0)
 
-    def test_rate_detection_fits_inside_the_keyframe_wait(self):
-        self.assertLessEqual(
-            AUDIO_RATE_WARMUP_SECONDS + AUDIO_RATE_SAMPLE_SECONDS, 5.0)
+    def test_enough_frames_are_timed_for_a_median_to_mean_something(self):
+        self.assertGreaterEqual(AUDIO_RATE_SAMPLE_FRAMES, 20)
+
+    def test_median_survives_bursts_and_stalls(self):
+        """The failure that shipped: a 2s window caught a quiet patch, measured
+        276 bytes/s, snapped to 8 kHz and halved the session's audio speed."""
+
+        def measure(gaps, size=640):
+            gaps = sorted(gaps)
+            return size / gaps[len(gaps) // 2]
+
+        def snap(measured):
+            return min(AUDIO_RATES, key=lambda r: abs(r - measured))
+
+        cases = {
+            "steady 16k": ([0.040] * 60, 16000),
+            "steady 8k": ([0.080] * 60, 8000),
+            "16k after a connect burst": ([0.001] * 20 + [0.040] * 40, 16000),
+            "16k with a stall": ([0.040] * 50 + [3.0] * 10, 16000),
+            "16k with both": ([0.001] * 15 + [0.040] * 35 + [3.0] * 10, 16000),
+        }
+        for name, (gaps, expected) in cases.items():
+            self.assertEqual(snap(measure(gaps)), expected, name)
 
     def test_codec_table_no_longer_assumes_a_rate(self):
         # the codec id does not carry the rate; assuming 8 kHz played 16 kHz

@@ -28,11 +28,16 @@ AUDIO_INPUTS = {
 # so a little jitter or a dropped frame cannot shift the answer.
 AUDIO_RATES = (8000, 16000)
 
-# How long to watch the stream before deciding its rate, and how much to throw away
-# first so the server's buffered burst does not read as a higher rate than the camera
-# sends. Together they stay inside the wait for the first video keyframe.
-AUDIO_RATE_WARMUP_SECONDS = 1.0
-AUDIO_RATE_SAMPLE_SECONDS = 2.0
+# Frames to discard before timing, so the burst the server flushes on connect is not
+# mistaken for the camera's pace, and frames to time afterwards. Counting frames rather
+# than watching a clock means a stall lengthens the measurement instead of corrupting
+# it. At 25 frames a second these cost roughly three seconds.
+AUDIO_RATE_SKIP_FRAMES = 15
+AUDIO_RATE_SAMPLE_FRAMES = 60
+
+# How far the measurement may sit from the rate we pick before it is worth warning
+# about. Anything larger means the stream is not behaving like either candidate.
+AUDIO_RATE_MAX_DRIFT = 0.35
 
 # how long to wait for the server to announce the codec before giving up on audio
 AUDIO_CODEC_TIMEOUT = 10.0
@@ -239,14 +244,12 @@ class RTSPBridge:
         dies, because it drains half as fast as the camera fills it.
         """
         loop = asyncio.get_running_loop()
-        first_seen: Optional[float] = None
-        started: Optional[float] = None
-        deadline = 0.0
-        nbytes = 0
+        seen = 0
+        prev: Optional[float] = None
+        gaps: list[float] = []
+        sizes: list[int] = []
         try:
-            while True:
-                if started is not None and loop.time() >= deadline:
-                    break
+            while len(gaps) < AUDIO_RATE_SAMPLE_FRAMES:
                 msg = await asyncio.wait_for(ws.receive(), timeout=AUDIO_CODEC_TIMEOUT)
                 if msg.type != aiohttp.WSMsgType.BINARY:
                     if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING,
@@ -254,34 +257,43 @@ class RTSPBridge:
                         logger.warning("Audio WebSocket closed while measuring its rate")
                         return None
                     continue
+                seen += 1
+                # Whatever the server had buffered arrives in a burst on connect, far
+                # faster than real time; skip it rather than time it.
+                if seen <= AUDIO_RATE_SKIP_FRAMES:
+                    continue
                 now = loop.time()
-                if first_seen is None:
-                    first_seen = now
-                    continue
-                if started is None:
-                    # Whatever the server had buffered arrives in a burst as soon as we
-                    # connect, far faster than real time. Let that drain before timing
-                    # anything, or the burst reads as a much higher rate than the camera
-                    # actually sends.
-                    if now - first_seen < AUDIO_RATE_WARMUP_SECONDS:
-                        continue
-                    started = now
-                    deadline = started + AUDIO_RATE_SAMPLE_SECONDS
-                    continue
-                nbytes += len(msg.data)
-        except (asyncio.TimeoutError, Exception) as e:
-            if isinstance(e, asyncio.CancelledError):
-                raise
+                if prev is not None:
+                    gaps.append(now - prev)
+                    sizes.append(len(msg.data))
+                prev = now
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
             logger.warning("Could not measure the audio rate: %s", e)
             return None
 
-        elapsed = asyncio.get_running_loop().time() - (started or 0)
-        if not started or elapsed <= 0 or nbytes == 0:
+        if not gaps:
             logger.warning("No audio arrived while measuring its rate")
             return None
-        measured = nbytes / elapsed
+        # Take the typical gap between frames rather than an average over a window.
+        # A window is at the mercy of whatever happens to fall inside it: one quiet
+        # patch once read as 276 bytes/s, which snapped to 8 kHz and played that whole
+        # session at half speed. Bursts and stalls both sit in the tails, so the
+        # median ignores them.
+        gaps.sort()
+        sizes.sort()
+        typical_gap = gaps[len(gaps) // 2]
+        typical_size = sizes[len(sizes) // 2]
+        if typical_gap <= 0:
+            logger.warning("Audio frames carried no usable timing")
+            return None
+        measured = typical_size / typical_gap
         rate = min(AUDIO_RATES, key=lambda r: abs(r - measured))
-        logger.info("Measured %.0f bytes/s of audio, treating it as %d Hz", measured, rate)
+        drift = abs(measured - rate) / rate
+        log = logger.warning if drift > AUDIO_RATE_MAX_DRIFT else logger.info
+        log("Audio measures %.0f bytes/s (%d B every %.0f ms), treating it as %d Hz",
+            measured, typical_size, typical_gap * 1000, rate)
         return rate
 
     async def _open_audio(

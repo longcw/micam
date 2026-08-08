@@ -9,6 +9,10 @@ on:
       - Dockerfile.miloco-audio
       - .github/workflows/docker-miloco-audio.yaml
 
+permissions:
+  contents: read
+  packages: write
+
 env:
   GITHUB_CR_REPO: ghcr.io/${{ github.repository_owner }}/miloco-audio
 

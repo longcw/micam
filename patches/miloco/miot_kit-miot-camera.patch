@@ -1,14 +1,17 @@
 --- a/miot_kit/miot/camera.py
 +++ b/miot_kit/miot/camera.py
-@@ -299,6 +299,30 @@
-     async def unregister_raw_audio_async(self, channel: int = 0, reg_id: int = 0) -> None:
-         """Unregister camera raw audio callback."""
-         reg_key: str = f"raw_audio.{channel}"
-+        if reg_key not in self._callbacks:
-+            return
-+        self._callbacks[reg_key].pop(str(reg_id), None)
-+        await self.__update_raw_data_register_status_async(channel=channel, is_register=False)
-+
+@@ -6,6 +6,7 @@
+ """
+ import asyncio
+ import logging
++import os
+ from ctypes import (
+     CDLL, CFUNCTYPE, POINTER, Structure, byref, string_at,
+     c_bool, c_char_p, c_int, c_uint8, c_uint32, c_uint64, c_void_p
+@@ -304,6 +305,30 @@
+         self._callbacks[reg_key].pop(str(reg_id), None)
+         await self.__update_raw_data_register_status_async(channel=channel, is_register=False)
+ 
 +    async def register_raw_audio_ex_async(
 +        self, callback: Callable[[str, bytes, int, int, int, int], Coroutine], channel: int = 0,
 +        multi_reg: bool = False
@@ -28,19 +31,24 @@
 +    async def unregister_raw_audio_ex_async(self, channel: int = 0, reg_id: int = 0) -> None:
 +        """Unregister camera raw audio codec-aware callback."""
 +        reg_key: str = f"raw_audio_ex.{channel}"
-         if reg_key not in self._callbacks:
-             return
-         self._callbacks[reg_key].pop(str(reg_id), None)
-@@ -382,6 +406,8 @@
-             if len(self._callbacks.get(f"raw_video.{channel}", {})) > 0:
++        if reg_key not in self._callbacks:
++            return
++        self._callbacks[reg_key].pop(str(reg_id), None)
++        await self.__update_raw_data_register_status_async(channel=channel, is_register=False)
++
+     async def register_decode_jpg_async(
+         self, callback: Callable[[str, bytes, int, int], Coroutine], channel: int = 0, multi_reg: bool = False
+     ) -> int:
+@@ -383,6 +408,8 @@
                  need_unreg = False
              if len(self._callbacks.get(f"raw_audio.{channel}", {})) > 0:
-+                need_unreg = False
-+            if len(self._callbacks.get(f"raw_audio_ex.{channel}", {})) > 0:
                  need_unreg = False
++            if len(self._callbacks.get(f"raw_audio_ex.{channel}", {})) > 0:
++                need_unreg = False
              if len(self._callbacks.get(f"decode_jpg.{channel}", {})) > 0:
                  need_unreg = False
-@@ -475,6 +501,14 @@
+             if len(self._callbacks.get(f"decode_pcm.{channel}", {})) > 0:
+@@ -475,6 +502,14 @@
              for a_callback in list(a_callbacks.values()):
                  asyncio.run_coroutine_threadsafe(
                      a_callback(self._did, frame_data.data, frame_data.timestamp, frame_data.sequence, channel),
@@ -55,3 +63,24 @@
                      self._main_loop
                  )
          else:
+@@ -906,4 +941,20 @@
+         result = MIoTCameraExtraInfo.model_validate(yaml.safe_load(await f.read()))
+     if not result:
+         raise MIoTCameraError(f"camera_extra_info.yaml file is empty, {file_path}")
++    # the shipped lists reject cameras that do work, so let a deployment name its own
++    # models instead of having to mount a whole edited yaml
++    for model in [item.strip() for item in os.getenv("CAMERA_ALLOW_MODELS", "").split(",") if item.strip()]:
++        fields = model.split(".")
++        if len(fields) < 2:
++            _LOGGER.error("invalid model in CAMERA_ALLOW_MODELS, %s", model)
++            continue
++        device_class = fields[1]
++        if device_class not in result.allow_classes:
++            result.allow_classes.append(device_class)
++        was_denied = result.denylist.get(device_class, {}).pop(model, None) is not None
++        # a class is filtered by whichever list holds it, so an allowlist class needs the entry adding
++        if device_class not in result.denylist:
++            result.allowlist.setdefault(device_class, {})[model] = {
++                "name": model, "reason": "allowed by CAMERA_ALLOW_MODELS"}
++        _LOGGER.info("camera model allowed by CAMERA_ALLOW_MODELS, %s, was denied: %s", model, was_denied)
+     return result

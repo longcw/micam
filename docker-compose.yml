@@ -10,6 +10,8 @@ services:
     environment:
       BACKEND_PORT: ${MILOCO_PORT:-8000}
       BACKEND_LOG_LEVEL: ${MILOCO_LOG_LEVEL:-warning}
+      # comma separated models to accept despite the shipped denylist
+      CAMERA_ALLOW_MODELS: ${CAMERA_ALLOW_MODELS:-}
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
       - ./miloco:/app/miloco_server/.temp

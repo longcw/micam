@@ -36,5 +36,13 @@ jobs:
           cd work
           for p in ../patches/miloco/*.patch; do
             echo "checking $(basename "$p")"
-            patch -p1 -F0 --dry-run < "$p"
+            patch -p1 -F0 < "$p"
           done
+
+      - name: Check CAMERA_ALLOW_MODELS against the shipped denylist
+        run: |
+          base=$(grep -oE 'ghcr\.io/miiot/miloco@sha256:[0-9a-f]+' Dockerfile.miloco-audio | head -1)
+          docker run -d --name miloco-check --entrypoint sleep "$base" 600
+          docker cp work/miot_kit/miot/camera.py miloco-check:/app/miot_kit/miot/camera.py
+          docker exec -i -w /app miloco-check python - < tests/check_camera_allow_models.py
+          docker rm -f miloco-check

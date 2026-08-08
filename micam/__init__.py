@@ -25,6 +25,16 @@ AUDIO_INPUTS = {
 # how long to wait for the server to announce the codec before giving up on audio
 AUDIO_CODEC_TIMEOUT = 10.0
 
+# Byte that encodes silence, per ffmpeg input format. Written to cover a gap so
+# the audio clock keeps pace with wall clock across a reconnect.
+AUDIO_SILENCE = {"alaw": b"\xd5", "mulaw": b"\xff"}
+
+# Pause before reopening a dropped audio socket, and how long audio may stay
+# down before the bridge restarts rather than keep advertising a track it
+# cannot deliver.
+AUDIO_RECONNECT_DELAY = 2.0
+AUDIO_GIVEUP_SECONDS = 60.0
+
 
 class RTSPBridge:
     def __init__(
@@ -55,6 +65,9 @@ class RTSPBridge:
         # set once the video loop is tearing down, so a shutting-down audio task
         # does not mistake an orderly stop for an audio failure
         self._shutting_down = False
+        # loop clock of the last audio frame written, used to size the silence
+        # that covers a reconnect gap
+        self._last_audio_at = 0.0
 
     async def _login(self) -> bool:
         """Login and retrieve access token."""
@@ -211,37 +224,90 @@ class RTSPBridge:
         await ws.close()
         return None, None
 
-    async def _stream_audio(self, ws):
-        """Pipe audio frames into FFmpeg once video is flowing."""
+    async def _drain_audio(self, ws) -> None:
+        """Pipe frames from one audio websocket until it ends."""
+        while True:
+            msg = await asyncio.wait_for(ws.receive(), timeout=60.0)
+            if msg.type == aiohttp.WSMsgType.BINARY:
+                await asyncio.wait_for(self.audio_write(msg.data), timeout=30.0)
+                self._last_audio_at = asyncio.get_running_loop().time()
+            elif msg.type == aiohttp.WSMsgType.TEXT:
+                # a codec change would need a different FFmpeg input, which a live
+                # session cannot be given, so stop rather than emit garbled audio
+                logger.warning("Audio codec changed mid-stream: %s", msg.data)
+                raise RuntimeError("audio codec changed")
+            elif msg.type == aiohttp.WSMsgType.ERROR:
+                raise RuntimeError(f"audio websocket error: {ws.exception()}")
+            elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED):
+                raise RuntimeError(f"audio websocket closed ({msg.type})")
+
+    async def _stream_audio(self, session, ws, audio_input):
+        """Keep audio flowing into FFmpeg, reconnecting as needed, while video runs.
+
+        The server drops these sockets periodically. Tearing the whole bridge down
+        each time also killed a perfectly healthy video stream, so instead the
+        socket is reopened and the silence covering the gap is written, which keeps
+        audio lined up with video. Only a gap that cannot be closed within
+        AUDIO_GIVEUP_SECONDS restarts the bridge, because at that point the stream
+        is advertising an audio track it can no longer deliver.
+        """
         await self.video_started.wait()
+        silence = AUDIO_SILENCE.get(audio_input[0], b"\xff")
+        rate = audio_input[1]
+        self._last_audio_at = asyncio.get_running_loop().time()
+        down_since: Optional[float] = None
         try:
-            while True:
-                msg = await asyncio.wait_for(ws.receive(), timeout=60.0)
-                if msg.type == aiohttp.WSMsgType.BINARY:
-                    await asyncio.wait_for(self.audio_write(msg.data), timeout=30.0)
-                elif msg.type == aiohttp.WSMsgType.TEXT:
-                    # a codec change mid-stream would need a new FFmpeg input, so stop instead of corrupting
-                    logger.warning("Audio codec changed mid-stream, dropping audio: %s", msg.data)
-                    break
-                elif msg.type == aiohttp.WSMsgType.ERROR:
-                    logger.error(f"Audio WebSocket closed with error {ws.exception()}")
-                    break
-                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED):
-                    logger.info("Audio WebSocket connection close(%s)", msg.type)
-                    break
+            while not self._shutting_down:
+                try:
+                    await self._drain_audio(ws)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning("Audio interrupted: %s", e)
+                finally:
+                    if ws is not None and not ws.closed:
+                        await ws.close()
+                    ws = None
+
+                now = asyncio.get_running_loop().time()
+                if down_since is None:
+                    down_since = now
+                if now - down_since > AUDIO_GIVEUP_SECONDS:
+                    logger.error(
+                        "Audio has been unavailable for %.0fs; restarting the bridge",
+                        now - down_since)
+                    return
+                await asyncio.sleep(AUDIO_RECONNECT_DELAY)
+                if self._shutting_down:
+                    return
+                ws, reconnected = await self._open_audio(session)
+                if ws is None or reconnected != audio_input:
+                    if ws is not None:
+                        await ws.close()
+                        ws = None
+                    continue
+                # FFmpeg times this input by counting samples, so a gap that is
+                # simply skipped shifts every later sample earlier and audio
+                # slides ahead of video. Filling the gap keeps them aligned.
+                gap = asyncio.get_running_loop().time() - self._last_audio_at
+                padded = min(gap, AUDIO_GIVEUP_SECONDS)
+                if padded > 0:
+                    await self.audio_write(silence * int(padded * rate))
+                    logger.info("Audio resumed; padded %.1fs of silence", padded)
+                self._last_audio_at = asyncio.get_running_loop().time()
+                down_since = None
         except asyncio.CancelledError:
             raise
-        except Exception as e:
-            logger.error("Audio streaming stopped: %s", e)
         finally:
+            if ws is not None and not ws.closed:
+                await ws.close()
             self._close_audio_fd()
             # FFmpeg already announced an audio track to the RTSP server, and that
-            # announcement cannot be withdrawn on a live session. Carrying on with
-            # video would publish a stream advertising audio that never arrives,
-            # which stalls consumers waiting on it. Restart the bridge instead, so
-            # the next session either carries audio or honestly has none.
+            # announcement cannot be withdrawn on a live session. Publishing a
+            # stream that advertises audio it never sends stalls consumers waiting
+            # on it, so give the bridge a clean restart instead.
             if not self._shutting_down:
-                logger.warning("Audio stream ended; restarting the bridge without a stale audio track")
+                logger.warning("Audio gone for good; restarting the bridge")
                 self._terminate_ffmpeg()
 
     async def run(self):
@@ -258,7 +324,11 @@ class RTSPBridge:
                 audio_ws, audio_input = await self._open_audio(session)
 
             self._start_ffmpeg(audio_input)
-            audio_task = asyncio.create_task(self._stream_audio(audio_ws)) if audio_ws else None
+            audio_task = (
+                asyncio.create_task(self._stream_audio(session, audio_ws, audio_input))
+                if audio_ws
+                else None
+            )
 
             ws_url = self._ws_url("video_stream")
             logger.info(f"Connecting to WebSocket: {ws_url}")

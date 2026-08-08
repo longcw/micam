@@ -3,7 +3,7 @@ import os
 import unittest
 from unittest import mock
 
-from micam import AUDIO_INPUTS, RTSPBridge
+from micam import AUDIO_GIVEUP_SECONDS, AUDIO_INPUTS, AUDIO_SILENCE, RTSPBridge
 
 
 def build_bridge(**kwargs):
@@ -122,6 +122,26 @@ class AudioFailureTest(unittest.TestCase):
 
     def test_orderly_shutdown_flag_defaults_off(self):
         self.assertFalse(build_bridge()._shutting_down)
+
+
+class SilencePaddingTest(unittest.TestCase):
+    def test_every_muxable_codec_has_a_silence_byte(self):
+        # a reconnect pads the gap with silence, so each format we can mux needs one
+        for fmt, _, _ in AUDIO_INPUTS.values():
+            self.assertIn(fmt, AUDIO_SILENCE)
+
+    def test_silence_bytes_match_the_encodings(self):
+        self.assertEqual(AUDIO_SILENCE["alaw"], b"\xd5")
+        self.assertEqual(AUDIO_SILENCE["mulaw"], b"\xff")
+
+    def test_one_second_of_padding_is_one_second_of_samples(self):
+        fmt, rate, _ = AUDIO_INPUTS[1027]
+        self.assertEqual(len(AUDIO_SILENCE[fmt] * int(1.0 * rate)), 8000)
+
+    def test_giveup_is_long_enough_to_ride_out_a_drop(self):
+        # the server drops these sockets every 40-90s; giving up sooner would put
+        # us back to restarting the bridge, and video with it
+        self.assertGreaterEqual(AUDIO_GIVEUP_SECONDS, 30.0)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,8 @@ from micam import (
     AUDIO_GIVEUP_SECONDS,
     AUDIO_INPUTS,
     AUDIO_RATES,
+    AUDIO_RATE_SAMPLE_SECONDS,
+    AUDIO_RATE_WARMUP_SECONDS,
     AUDIO_RECONNECT_DELAY,
     AUDIO_SILENCE,
     RTSPBridge,
@@ -171,6 +173,15 @@ class RateDetectionTest(unittest.TestCase):
         ]:
             got = min(AUDIO_RATES, key=lambda r: abs(r - measured))
             self.assertEqual(got, expected, f"{measured} -> {got}")
+
+    def test_warmup_precedes_measurement(self):
+        # the server flushes its buffer on connect much faster than real time, and
+        # timing that burst reads as roughly double the real rate
+        self.assertGreater(AUDIO_RATE_WARMUP_SECONDS, 0)
+
+    def test_rate_detection_fits_inside_the_keyframe_wait(self):
+        self.assertLessEqual(
+            AUDIO_RATE_WARMUP_SECONDS + AUDIO_RATE_SAMPLE_SECONDS, 5.0)
 
     def test_codec_table_no_longer_assumes_a_rate(self):
         # the codec id does not carry the rate; assuming 8 kHz played 16 kHz

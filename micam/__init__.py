@@ -28,8 +28,10 @@ AUDIO_INPUTS = {
 # so a little jitter or a dropped frame cannot shift the answer.
 AUDIO_RATES = (8000, 16000)
 
-# How long to watch the stream before deciding its rate. Long enough to average out
-# jitter, short enough to sit inside the wait for the first video keyframe.
+# How long to watch the stream before deciding its rate, and how much to throw away
+# first so the server's buffered burst does not read as a higher rate than the camera
+# sends. Together they stay inside the wait for the first video keyframe.
+AUDIO_RATE_WARMUP_SECONDS = 1.0
 AUDIO_RATE_SAMPLE_SECONDS = 2.0
 
 # how long to wait for the server to announce the codec before giving up on audio
@@ -207,13 +209,14 @@ class RTSPBridge:
         every recording at half speed, and starves FFmpeg's pipe until the socket
         dies, because it drains half as fast as the camera fills it.
         """
-        deadline = asyncio.get_running_loop().time() + AUDIO_RATE_SAMPLE_SECONDS
-        nbytes = 0
+        loop = asyncio.get_running_loop()
+        first_seen: Optional[float] = None
         started: Optional[float] = None
+        deadline = 0.0
+        nbytes = 0
         try:
             while True:
-                now = asyncio.get_running_loop().time()
-                if started is not None and now >= deadline:
+                if started is not None and loop.time() >= deadline:
                     break
                 msg = await asyncio.wait_for(ws.receive(), timeout=AUDIO_CODEC_TIMEOUT)
                 if msg.type != aiohttp.WSMsgType.BINARY:
@@ -222,9 +225,18 @@ class RTSPBridge:
                         logger.warning("Audio WebSocket closed while measuring its rate")
                         return None
                     continue
+                now = loop.time()
+                if first_seen is None:
+                    first_seen = now
+                    continue
                 if started is None:
-                    # start the clock on the first frame, so connection setup is excluded
-                    started = asyncio.get_running_loop().time()
+                    # Whatever the server had buffered arrives in a burst as soon as we
+                    # connect, far faster than real time. Let that drain before timing
+                    # anything, or the burst reads as a much higher rate than the camera
+                    # actually sends.
+                    if now - first_seen < AUDIO_RATE_WARMUP_SECONDS:
+                        continue
+                    started = now
                     deadline = started + AUDIO_RATE_SAMPLE_SECONDS
                     continue
                 nbytes += len(msg.data)

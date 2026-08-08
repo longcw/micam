@@ -52,6 +52,9 @@ AUDIO_RECONNECT_DELAY = 0.5
 # policy can bring it back than hanging on forever.
 SHUTDOWN_TIMEOUT = 10.0
 
+# Longest we wait for FFmpeg's stderr to reach EOF after asking it to exit.
+STDERR_READ_TIMEOUT = 5.0
+
 # How long audio may stay down before the bridge restarts rather than keep
 # advertising a track it cannot deliver.
 AUDIO_GIVEUP_SECONDS = 60.0
@@ -549,13 +552,30 @@ class RTSPBridge:
         os.write(self.audio_fd, data)
 
     async def process_stderr(self):
-        if not self.process:
-            raise RuntimeError("Process not started")
-        if not self.process.stderr:
+        """Log whatever FFmpeg wrote to stderr, without waiting on a live process.
+
+        The read runs to EOF, and EOF only arrives once FFmpeg exits, so calling
+        this while it is merely wedged blocks forever — and on the event loop,
+        which freezes the whole bridge before it can tear anything down. Send it
+        on its way first, then read off the loop with a deadline.
+        """
+        proc = self.process
+        if proc is None or proc.stderr is None:
             return
-        stderr = self.process.stderr.read().decode()
-        if stderr:
-            logger.error(f"FFmpeg stderr: %s", stderr)
+        self._terminate_ffmpeg()
+        loop = asyncio.get_running_loop()
+        try:
+            data = await asyncio.wait_for(
+                loop.run_in_executor(None, proc.stderr.read), STDERR_READ_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.error("Gave up reading FFmpeg stderr")
+            return
+        except Exception as e:
+            logger.error("Could not read FFmpeg stderr: %s", e)
+            return
+        text = data.decode(errors="replace") if data else ""
+        if text.strip():
+            logger.error("FFmpeg stderr: %s", text.strip())
 
 
 def main():

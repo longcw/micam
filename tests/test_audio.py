@@ -12,6 +12,7 @@ from micam import (
     AUDIO_RECONNECT_DELAY,
     AUDIO_SILENCE,
     SHUTDOWN_TIMEOUT,
+    STDERR_READ_TIMEOUT,
     RTSPBridge,
 )
 
@@ -205,6 +206,12 @@ class TeardownOrderTest(unittest.TestCase):
         with mock.patch("os.close", side_effect=lambda fd: order.append("close_pipe")):
             bridge._stop_ffmpeg()
         self.assertEqual(order, ["kill_ffmpeg", "close_pipe"])
+
+    def test_stderr_read_is_bounded(self):
+        # reading FFmpeg's stderr runs to EOF, which never arrives while it is
+        # merely wedged, and it froze the event loop before teardown could run
+        self.assertGreater(STDERR_READ_TIMEOUT, 0)
+        self.assertLessEqual(STDERR_READ_TIMEOUT, 30)
 
     def test_shutdown_wait_is_bounded(self):
         self.assertGreater(SHUTDOWN_TIMEOUT, 0)

@@ -8,6 +8,8 @@ from micam import (
     AUDIO_INPUTS,
     AUDIO_RATES,
     AUDIO_PACE_INTERVAL,
+    AUDIO_QUEUE_MAX_SECONDS,
+    AUDIO_QUEUE_TARGET_SECONDS,
     AUDIO_BURST_GAP,
     AUDIO_GAP_MAX,
     AUDIO_GAP_MIN,
@@ -356,6 +358,41 @@ class PacerTest(unittest.TestCase):
     def test_a_burst_is_spent_rather_than_dropped(self):
         self.assertEqual(
             self.assert_exact(lambda i: b"x" * 20000 if i == 0 else b"x" * 320), 0)
+
+
+class QueueTrimTest(unittest.TestCase):
+    RATE = 16000
+
+    def run_queue(self, ticks=600, burst=20000):
+        """Trimming to a target leaves headroom. Trimming to the limit does not, and
+        the queue then sits pinned there with every frame tripping it — which shipped
+        as 3540 trims in one session and left audio a second behind video."""
+        top = int(self.RATE * AUDIO_QUEUE_MAX_SECONDS)
+        target = int(self.RATE * AUDIO_QUEUE_TARGET_SECONDS)
+        queue = bytearray()
+        trims = 0
+        for tick in range(ticks):
+            queue.extend(b"x" * (burst if tick == 0 else 320))
+            if len(queue) > top:
+                del queue[: len(queue) - target]
+                trims += 1
+            take = min(320, len(queue))
+            del queue[:take]
+        return trims, len(queue) / self.RATE
+
+    def test_a_burst_is_trimmed_once_not_every_frame(self):
+        trims, _ = self.run_queue()
+        self.assertEqual(trims, 1)
+
+    def test_queue_settles_near_the_target(self):
+        _, backlog = self.run_queue()
+        self.assertLessEqual(backlog, AUDIO_QUEUE_TARGET_SECONDS + 0.05)
+
+    def test_target_leaves_headroom_under_the_limit(self):
+        self.assertLess(AUDIO_QUEUE_TARGET_SECONDS, AUDIO_QUEUE_MAX_SECONDS)
+
+    def test_backlog_stays_short_enough_not_to_be_heard_as_lag(self):
+        self.assertLessEqual(AUDIO_QUEUE_MAX_SECONDS, 1.0)
 
 
 if __name__ == "__main__":

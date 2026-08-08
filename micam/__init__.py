@@ -70,6 +70,16 @@ AUDIO_RECONNECT_DELAY = 0.5
 # hand, long enough not to spend the whole time waking up.
 AUDIO_PACE_INTERVAL = 0.02
 
+# How much audio may wait to be paced, and what a trim cuts back to. This is how far
+# audio trails video, so it stays small; trimming to a target rather than to the limit
+# leaves headroom, without which the queue sits pinned at the limit and every frame
+# trips it.
+AUDIO_QUEUE_MAX_SECONDS = 0.5
+AUDIO_QUEUE_TARGET_SECONDS = 0.15
+
+# How often to mention trimming. Per-frame warnings buried every other log line.
+AUDIO_DROP_REPORT_INTERVAL = 30.0
+
 # A paced write should never block, since it matches what FFmpeg consumes; this only
 # catches FFmpeg having stopped reading entirely.
 AUDIO_WRITE_TIMEOUT = 10.0
@@ -120,6 +130,8 @@ class RTSPBridge:
         # dropping the oldest to keep audio close behind video
         self._audio_queue = bytearray()
         self._audio_queue_max = 0
+        self._audio_queue_target = 0
+        self._audio_dropped = 0
 
     async def _login(self) -> bool:
         """Login and retrieve access token."""
@@ -385,14 +397,15 @@ class RTSPBridge:
         while True:
             msg = await asyncio.wait_for(ws.receive(), timeout=60.0)
             if msg.type == aiohttp.WSMsgType.BINARY:
-                # Hand the frame to the pacer rather than to FFmpeg. Dropping the
-                # oldest audio when the queue runs long keeps the delay behind video
-                # bounded; the alternative is a backlog that grows all session.
+                # Hand the frame to the pacer rather than to FFmpeg. A backlog left to
+                # grow would put audio further and further behind video, so trim it —
+                # but trim back to a target rather than to the limit, or the queue sits
+                # pinned at the limit and every single frame trips it.
                 self._audio_queue.extend(msg.data)
-                overflow = len(self._audio_queue) - self._audio_queue_max
-                if overflow > 0:
-                    del self._audio_queue[:overflow]
-                    logger.warning("Audio queue overran by %d bytes; dropped the oldest", overflow)
+                if len(self._audio_queue) > self._audio_queue_max:
+                    dropped = len(self._audio_queue) - self._audio_queue_target
+                    del self._audio_queue[:dropped]
+                    self._audio_dropped += dropped
             elif msg.type == aiohttp.WSMsgType.TEXT:
                 # a codec change would need a different FFmpeg input, which a live
                 # session cannot be given, so stop rather than emit garbled audio
@@ -416,8 +429,14 @@ class RTSPBridge:
         loop = asyncio.get_running_loop()
         start = loop.time()
         written = 0
+        reported = start
         while not self._shutting_down and self.audio_fd is not None:
             await asyncio.sleep(AUDIO_PACE_INTERVAL)
+            if self._audio_dropped and loop.time() - reported > AUDIO_DROP_REPORT_INTERVAL:
+                logger.info("Trimmed %.1fs of audio backlog to stay close behind video",
+                            self._audio_dropped / rate)
+                self._audio_dropped = 0
+                reported = loop.time()
             # Derive what is owed from elapsed time rather than counting ticks, so a
             # late wakeup is made up rather than accumulating into drift.
             owed = int((loop.time() - start) * rate) - written
@@ -450,9 +469,11 @@ class RTSPBridge:
         fmt, rate, _ = audio_input
         silence = AUDIO_SILENCE.get(fmt, b"\xff")
         self._audio_queue = bytearray()
-        # Hold at most a second of audio, so a burst cannot push audio a growing
-        # distance behind video.
-        self._audio_queue_max = rate
+        # Keep only a short backlog: it is how far audio trails video, and the server
+        # dumps a large burst on connect that would otherwise become permanent lag.
+        self._audio_queue_max = int(rate * AUDIO_QUEUE_MAX_SECONDS)
+        self._audio_queue_target = int(rate * AUDIO_QUEUE_TARGET_SECONDS)
+        self._audio_dropped = 0
         pacer = asyncio.create_task(self._pace_audio(rate, silence))
         down_since: Optional[float] = None
         try:

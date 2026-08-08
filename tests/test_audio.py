@@ -8,6 +8,9 @@ from micam import (
     AUDIO_INPUTS,
     AUDIO_RATES,
     AUDIO_BURST_GAP,
+    AUDIO_GAP_MAX,
+    AUDIO_GAP_MIN,
+    AUDIO_RATE_MIN_PLAUSIBLE,
     AUDIO_RATE_SAMPLE_FRAMES,
     AUDIO_RECONNECT_DELAY,
     AUDIO_SILENCE,
@@ -250,6 +253,38 @@ class TeardownOrderTest(unittest.TestCase):
     def test_shutdown_wait_is_bounded(self):
         self.assertGreater(SHUTDOWN_TIMEOUT, 0)
         self.assertLessEqual(SHUTDOWN_TIMEOUT, 30)
+
+
+class CadencePlausibilityTest(unittest.TestCase):
+    """A wrong rate is worse than no audio: it plays the whole session at the
+    wrong speed, whereas video-only is merely a missing feature."""
+
+    def decide(self, gaps, size=640):
+        kept = [g for g in gaps if g >= AUDIO_BURST_GAP]
+        plausible = sorted(g for g in kept if AUDIO_GAP_MIN <= g <= AUDIO_GAP_MAX)
+        if len(plausible) < AUDIO_RATE_MIN_PLAUSIBLE:
+            return None
+        return min(AUDIO_RATES,
+                   key=lambda r: abs(r - size / plausible[len(plausible) // 2]))
+
+    def test_settled_streams_are_measured(self):
+        self.assertEqual(self.decide([0.040] * 50), 16000)
+        self.assertEqual(self.decide([0.080] * 50), 8000)
+        self.assertEqual(self.decide([0.001] * 300 + [0.040] * 50), 16000)
+
+    def test_reconnect_ramp_is_refused_rather_than_guessed(self):
+        # observed after a stall: frames trickling in at 144ms and 267ms against a
+        # steady 40ms, which read as 8kHz and halved the session's speed
+        self.assertIsNone(self.decide([0.267] * 50))
+        self.assertIsNone(self.decide([0.144] * 50))
+
+    def test_a_ramp_that_settles_is_measured_from_the_settled_part(self):
+        self.assertEqual(self.decide([0.267] * 20 + [0.040] * 30), 16000)
+
+    def test_both_candidate_cadences_sit_inside_the_band(self):
+        for gap in (0.040, 0.080):
+            self.assertLessEqual(AUDIO_GAP_MIN, gap)
+            self.assertGreaterEqual(AUDIO_GAP_MAX, gap)
 
 
 if __name__ == "__main__":

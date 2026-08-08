@@ -34,6 +34,15 @@ AUDIO_RATES = (8000, 16000)
 # and the exact threshold does not matter.
 AUDIO_BURST_GAP = 0.005
 
+# The cadence a settled G.711 camera keeps. 640-byte frames land every 40 ms at
+# 16 kHz and every 80 ms at 8 kHz, so anything outside this band is the stream still
+# ramping up rather than the camera's pace, and timing it picks the wrong rate.
+AUDIO_GAP_MIN = 0.015
+AUDIO_GAP_MAX = 0.120
+
+# How many frames must arrive at a sensible cadence before the reading is trusted.
+AUDIO_RATE_MIN_PLAUSIBLE = 20
+
 # Frames to time once the burst is out of the way, and the longest we will spend
 # gathering them before going with what we have. At 25 frames a second the sample is
 # about two seconds.
@@ -285,6 +294,18 @@ class RTSPBridge:
         if not gaps:
             logger.warning("No audio arrived while measuring its rate")
             return None
+        # Frames arriving nowhere near either candidate's cadence mean the stream
+        # has not settled — after a reconnect they trickle in at 150-270ms against a
+        # steady 40ms. Reading a rate off that picks the wrong one and plays the whole
+        # session at the wrong speed, so wait for a cadence that makes sense instead.
+        plausible = [g for g in gaps if AUDIO_GAP_MIN <= g <= AUDIO_GAP_MAX]
+        if len(plausible) < AUDIO_RATE_MIN_PLAUSIBLE:
+            logger.warning(
+                "Audio cadence never settled (%d of %d frames plausible); "
+                "publishing video only this session",
+                len(plausible), len(gaps))
+            return None
+        gaps = plausible
         # Take the typical gap between frames rather than an average over a window.
         # A window is at the mercy of whatever happens to fall inside it: one quiet
         # patch once read as 276 bytes/s, which snapped to 8 kHz and played that whole

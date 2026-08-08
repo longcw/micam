@@ -7,9 +7,6 @@ from micam import (
     AUDIO_GIVEUP_SECONDS,
     AUDIO_INPUTS,
     AUDIO_RATES,
-    AUDIO_PACE_INTERVAL,
-    AUDIO_QUEUE_MAX_SECONDS,
-    AUDIO_QUEUE_TARGET_SECONDS,
     AUDIO_BURST_GAP,
     AUDIO_GAP_MAX,
     AUDIO_GAP_MIN,
@@ -307,108 +304,23 @@ class CadencePlausibilityTest(unittest.TestCase):
             self.assertGreaterEqual(AUDIO_GAP_MAX, gap)
 
 
-class PacerTest(unittest.TestCase):
-    """FFmpeg expects a steady stream and stalls the whole mux without one, which
-    backs up into the video write and takes the bridge down. The websocket cannot
-    promise steadiness, so the pacer supplies it."""
+class BackpressureTest(unittest.TestCase):
+    """FFmpeg keeps its inputs aligned, so it stops reading audio when audio gets
+    ahead of video. Writing on our own schedule overrode that signal, and audio
+    outran video whenever the camera's frames arrived a little late."""
 
-    RATE = 16000
-
-    def run_pacer(self, supply, ticks=250):
-        """Mirror of _pace_audio's arithmetic, with deliberately late wakeups."""
-        queue = bytearray()
-        written = silence = 0
-        now = 0.0
-        for i in range(ticks):
-            now += AUDIO_PACE_INTERVAL * (1.6 if i % 37 == 0 else 1.0)
-            queue.extend(supply(i))
-            overflow = len(queue) - self.RATE
-            if overflow > 0:
-                del queue[:overflow]
-            owed = int(now * self.RATE) - written
-            if owed <= 0:
-                continue
-            have = min(owed, len(queue))
-            del queue[:have]
-            silence += owed - have
-            written += owed
-        return written, silence, now
-
-    def assert_exact(self, supply):
-        written, silence, now = self.run_pacer(supply)
-        self.assertEqual(written, int(now * self.RATE))
-        return silence
-
-    def test_output_matches_the_declared_rate_whatever_arrives(self):
-        # late wakeups are made up rather than accumulating into drift
-        self.assert_exact(lambda i: b"x" * 320)
-        self.assert_exact(lambda i: b"")
-        self.assert_exact(lambda i: b"x" * 20000 if i == 0 else b"x" * 320)
-
-    def test_a_dropout_becomes_silence_of_the_same_length(self):
-        silence = self.assert_exact(lambda i: b"" if 50 < i < 110 else b"x" * 320)
-        # 60 ticks of 20ms is about 1.2s
-        self.assertAlmostEqual(silence / self.RATE, 1.2, delta=0.2)
-
-    def test_silence_covers_the_whole_run_when_nothing_arrives(self):
-        silence = self.assert_exact(lambda i: b"")
-        self.assertGreater(silence, 0)
-
-    def test_a_burst_is_spent_rather_than_dropped(self):
-        self.assertEqual(
-            self.assert_exact(lambda i: b"x" * 20000 if i == 0 else b"x" * 320), 0)
-
-
-class QueueTrimTest(unittest.TestCase):
-    RATE = 16000
-
-    def run_queue(self, ticks=600, burst=20000):
-        """Trimming to a target leaves headroom. Trimming to the limit does not, and
-        the queue then sits pinned there with every frame tripping it — which shipped
-        as 3540 trims in one session and left audio a second behind video."""
-        top = int(self.RATE * AUDIO_QUEUE_MAX_SECONDS)
-        target = int(self.RATE * AUDIO_QUEUE_TARGET_SECONDS)
-        queue = bytearray()
-        trims = 0
-        for tick in range(ticks):
-            queue.extend(b"x" * (burst if tick == 0 else 320))
-            if len(queue) > top:
-                del queue[: len(queue) - target]
-                trims += 1
-            take = min(320, len(queue))
-            del queue[:take]
-        return trims, len(queue) / self.RATE
-
-    def test_a_burst_is_trimmed_once_not_every_frame(self):
-        trims, _ = self.run_queue()
-        self.assertEqual(trims, 1)
-
-    def test_queue_settles_near_the_target(self):
-        _, backlog = self.run_queue()
-        self.assertLessEqual(backlog, AUDIO_QUEUE_TARGET_SECONDS + 0.05)
-
-    def test_target_leaves_headroom_under_the_limit(self):
-        self.assertLess(AUDIO_QUEUE_TARGET_SECONDS, AUDIO_QUEUE_MAX_SECONDS)
-
-    def test_backlog_stays_short_enough_not_to_be_heard_as_lag(self):
-        self.assertLessEqual(AUDIO_QUEUE_MAX_SECONDS, 1.0)
-
-
-class PacerFailureTest(unittest.TestCase):
-    def test_a_blocked_write_brings_ffmpeg_down(self):
-        """Returning quietly left audio stopped for good, which guaranteed the
-        starvation that stalled video 33 seconds later."""
-        bridge = build_bridge()
-        proc = mock.Mock()
-        proc.poll.return_value = None
-        bridge.process = proc
-        bridge._terminate_ffmpeg()
-        proc.terminate.assert_called_once()
-
-    def test_write_timeout_is_short_enough_to_act_on(self):
+    def test_write_timeout_allows_ffmpeg_to_hold_audio_back(self):
         from micam import AUDIO_WRITE_TIMEOUT
-        # a paced write matches consumption, so blocking at all means trouble
-        self.assertLessEqual(AUDIO_WRITE_TIMEOUT, 5.0)
+        # a short timeout treats normal backpressure as a fault; this only needs to
+        # catch FFmpeg having stopped reading altogether
+        self.assertGreaterEqual(AUDIO_WRITE_TIMEOUT, 15.0)
+
+    def test_silence_covers_a_gap_so_later_samples_keep_their_place(self):
+        # FFmpeg times this input by counting samples, so a skipped gap shifts every
+        # later sample earlier and slides audio ahead of video for good
+        rate = 16000
+        for gap in (0.5, 2.0, 5.0):
+            self.assertEqual(len(AUDIO_SILENCE["alaw"] * int(gap * rate)), int(gap * rate))
 
 
 if __name__ == "__main__":

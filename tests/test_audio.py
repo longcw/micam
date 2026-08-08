@@ -6,10 +6,17 @@ from unittest import mock
 from micam import (
     AUDIO_GIVEUP_SECONDS,
     AUDIO_INPUTS,
+    AUDIO_RATES,
     AUDIO_RECONNECT_DELAY,
     AUDIO_SILENCE,
     RTSPBridge,
 )
+
+
+def audio_input(codec_id, rate=8000):
+    """(format, rate, channels) as _open_audio assembles it after measuring."""
+    fmt, channels = AUDIO_INPUTS[codec_id]
+    return fmt, rate, channels
 
 
 def build_bridge(**kwargs):
@@ -43,7 +50,7 @@ class StartFfmpegTest(unittest.TestCase):
 
     def test_g711a_adds_a_second_input_and_copies_it(self):
         bridge = build_bridge()
-        cmd, kwargs = self.start(bridge, AUDIO_INPUTS[1027])
+        cmd, kwargs = self.start(bridge, audio_input(1027))
         self.assertEqual(cmd.count("-i"), 2)
         self.assertIn("alaw", cmd)
         self.assertIn("pipe:7", cmd)
@@ -55,16 +62,16 @@ class StartFfmpegTest(unittest.TestCase):
         self.assertEqual(bridge.audio_fd, 8)
 
     def test_g711u_selects_mulaw(self):
-        cmd, _ = self.start(build_bridge(), AUDIO_INPUTS[1026])
+        cmd, _ = self.start(build_bridge(), audio_input(1026))
         self.assertIn("mulaw", cmd)
 
     def test_video_input_precedes_audio_input(self):
-        cmd, _ = self.start(build_bridge(), AUDIO_INPUTS[1027])
+        cmd, _ = self.start(build_bridge(), audio_input(1027))
         # -map 0:v / -map 1:a rely on this order
         self.assertLess(cmd.index("pipe:0"), cmd.index("pipe:7"))
 
     def test_only_video_is_stamped_from_the_wallclock(self):
-        cmd, _ = self.start(build_bridge(), AUDIO_INPUTS[1027])
+        cmd, _ = self.start(build_bridge(), audio_input(1027))
         # stamping raw PCM by arrival time compresses bursts and runs audio ahead of video
         self.assertEqual(cmd.count("-use_wallclock_as_timestamps"), 1)
         self.assertLess(cmd.index("-use_wallclock_as_timestamps"), cmd.index("pipe:0"))
@@ -77,8 +84,8 @@ class AudioInputTableTest(unittest.TestCase):
 
     def test_g711_pair_is_eight_kilohertz_mono(self):
         for codec_id in (1026, 1027):
-            _, rate, channels = AUDIO_INPUTS[codec_id]
-            self.assertEqual((rate, channels), (8000, 1))
+            _, channels = AUDIO_INPUTS[codec_id]
+            self.assertEqual(channels, 1)
 
 
 class CloseAudioFdTest(unittest.TestCase):
@@ -133,7 +140,7 @@ class AudioFailureTest(unittest.TestCase):
 class SilencePaddingTest(unittest.TestCase):
     def test_every_muxable_codec_has_a_silence_byte(self):
         # a reconnect pads the gap with silence, so each format we can mux needs one
-        for fmt, _, _ in AUDIO_INPUTS.values():
+        for fmt, _ in AUDIO_INPUTS.values():
             self.assertIn(fmt, AUDIO_SILENCE)
 
     def test_silence_bytes_match_the_encodings(self):
@@ -141,8 +148,8 @@ class SilencePaddingTest(unittest.TestCase):
         self.assertEqual(AUDIO_SILENCE["mulaw"], b"\xff")
 
     def test_one_second_of_padding_is_one_second_of_samples(self):
-        fmt, rate, _ = AUDIO_INPUTS[1027]
-        self.assertEqual(len(AUDIO_SILENCE[fmt] * int(1.0 * rate)), 8000)
+        fmt, _ = AUDIO_INPUTS[1027]
+        self.assertEqual(len(AUDIO_SILENCE[fmt] * int(1.0 * 16000)), 16000)
 
     def test_reconnect_delay_stays_short(self):
         # the delay becomes silence in the recording, and drops come every couple
@@ -153,6 +160,23 @@ class SilencePaddingTest(unittest.TestCase):
         # the server drops these sockets every 40-90s; giving up sooner would put
         # us back to restarting the bridge, and video with it
         self.assertGreaterEqual(AUDIO_GIVEUP_SECONDS, 30.0)
+
+
+class RateDetectionTest(unittest.TestCase):
+    def test_measured_rates_snap_to_the_nearest_supported_one(self):
+        # jitter and the odd dropped frame must not shift the answer
+        for measured, expected in [
+            (7900, 8000), (8200, 8000), (11000, 8000),
+            (13000, 16000), (15994, 16000), (16400, 16000),
+        ]:
+            got = min(AUDIO_RATES, key=lambda r: abs(r - measured))
+            self.assertEqual(got, expected, f"{measured} -> {got}")
+
+    def test_codec_table_no_longer_assumes_a_rate(self):
+        # the codec id does not carry the rate; assuming 8 kHz played 16 kHz
+        # cameras at half speed and starved the pipe
+        for value in AUDIO_INPUTS.values():
+            self.assertEqual(len(value), 2)
 
 
 if __name__ == "__main__":

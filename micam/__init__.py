@@ -14,13 +14,23 @@ logger = logging.getLogger(__name__)
 # MIoT codec ids, for logging cameras we cannot mux yet
 AUDIO_CODEC_NAMES = {1024: 'PCM', 1026: 'G711U', 1027: 'G711A', 1032: 'OPUS'}
 
-# codec id -> (ffmpeg input format, sample rate, channels). Cameras send bare frames with
-# no container, so the format has to be declared rather than probed. Opus is absent on
-# purpose: its frames need Ogg or RTP framing before FFmpeg will accept them.
+# codec id -> (ffmpeg input format, channels). Cameras send bare frames with no
+# container, so the format has to be declared rather than probed. The sample rate is
+# measured instead of listed here, because the codec id does not carry it and cameras
+# run G.711 at either 8 or 16 kHz. Opus is absent on purpose: its frames need Ogg or
+# RTP framing before FFmpeg will accept them.
 AUDIO_INPUTS = {
-    1026: ('mulaw', 8000, 1),
-    1027: ('alaw', 8000, 1),
+    1026: ('mulaw', 1),
+    1027: ('alaw', 1),
 }
+
+# Sample rates G.711 cameras use. The measured byte rate is snapped to the nearest,
+# so a little jitter or a dropped frame cannot shift the answer.
+AUDIO_RATES = (8000, 16000)
+
+# How long to watch the stream before deciding its rate. Long enough to average out
+# jitter, short enough to sit inside the wait for the first video keyframe.
+AUDIO_RATE_SAMPLE_SECONDS = 2.0
 
 # how long to wait for the server to announce the codec before giving up on audio
 AUDIO_CODEC_TIMEOUT = 10.0
@@ -187,8 +197,61 @@ class RTSPBridge:
                     self.process.kill()
             self.process = None
 
-    async def _open_audio(self, session) -> Tuple[Optional[object], Optional[Tuple[str, int, int]]]:
-        """Connect the audio stream and wait for the codec the camera is sending."""
+    async def _measure_rate(self, ws) -> Optional[int]:
+        """Work out the sample rate by timing the frames the camera actually sends.
+
+        Nothing announces it: the codec id says G.711 but not whether the camera
+        runs it at narrowband or wideband, and cameras differ. G.711 carries one
+        byte per sample, so the arriving byte rate is the sample rate. Guessing
+        wrong is not a subtle error — assuming 8 kHz for a 16 kHz camera plays
+        every recording at half speed, and starves FFmpeg's pipe until the socket
+        dies, because it drains half as fast as the camera fills it.
+        """
+        deadline = asyncio.get_running_loop().time() + AUDIO_RATE_SAMPLE_SECONDS
+        nbytes = 0
+        started: Optional[float] = None
+        try:
+            while True:
+                now = asyncio.get_running_loop().time()
+                if started is not None and now >= deadline:
+                    break
+                msg = await asyncio.wait_for(ws.receive(), timeout=AUDIO_CODEC_TIMEOUT)
+                if msg.type != aiohttp.WSMsgType.BINARY:
+                    if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING,
+                                    aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        logger.warning("Audio WebSocket closed while measuring its rate")
+                        return None
+                    continue
+                if started is None:
+                    # start the clock on the first frame, so connection setup is excluded
+                    started = asyncio.get_running_loop().time()
+                    deadline = started + AUDIO_RATE_SAMPLE_SECONDS
+                    continue
+                nbytes += len(msg.data)
+        except (asyncio.TimeoutError, Exception) as e:
+            if isinstance(e, asyncio.CancelledError):
+                raise
+            logger.warning("Could not measure the audio rate: %s", e)
+            return None
+
+        elapsed = asyncio.get_running_loop().time() - (started or 0)
+        if not started or elapsed <= 0 or nbytes == 0:
+            logger.warning("No audio arrived while measuring its rate")
+            return None
+        measured = nbytes / elapsed
+        rate = min(AUDIO_RATES, key=lambda r: abs(r - measured))
+        logger.info("Measured %.0f bytes/s of audio, treating it as %d Hz", measured, rate)
+        return rate
+
+    async def _open_audio(
+        self, session, known_rate: Optional[int] = None
+    ) -> Tuple[Optional[object], Optional[Tuple[str, int, int]]]:
+        """Connect the audio stream and wait for the codec the camera is sending.
+
+        ``known_rate`` skips the measurement on a reconnect: FFmpeg is already
+        running with that rate on its input and cannot be retuned mid-session, so
+        measuring again would only add silence to the gap.
+        """
         ws_url = self._ws_url("audio_stream")
         logger.info(f"Connecting to audio WebSocket: {ws_url}")
         try:
@@ -215,8 +278,13 @@ class RTSPBridge:
                 codec_name = AUDIO_CODEC_NAMES.get(codec_id, "unknown")
                 audio_input = AUDIO_INPUTS.get(codec_id)
                 if audio_input:
-                    logger.info("Audio codec %s(%s), muxing as %s", codec_name, codec_id, audio_input[0])
-                    return ws, audio_input
+                    fmt, channels = audio_input
+                    rate = known_rate or await self._measure_rate(ws)
+                    if rate is None:
+                        break
+                    logger.info(
+                        "Audio codec %s(%s) at %d Hz, muxing as %s", codec_name, codec_id, rate, fmt)
+                    return ws, (fmt, rate, channels)
                 logger.warning(
                     "Audio codec %s(%s) is not supported yet, continuing without audio", codec_name, codec_id)
                 break
@@ -284,12 +352,16 @@ class RTSPBridge:
                 await asyncio.sleep(AUDIO_RECONNECT_DELAY)
                 if self._shutting_down:
                     return
-                ws, reconnected = await self._open_audio(session)
-                if ws is None or reconnected != audio_input:
-                    if ws is not None:
-                        await ws.close()
-                        ws = None
+                ws, reconnected = await self._open_audio(session, known_rate=rate)
+                if ws is None:
                     continue
+                if reconnected != audio_input:
+                    # FFmpeg's audio input is fixed for the life of the process, so a
+                    # camera that came back speaking differently needs a fresh one
+                    logger.warning("Audio came back as %s, not %s; restarting the bridge",
+                                   reconnected, audio_input)
+                    await ws.close()
+                    return
                 # FFmpeg times this input by counting samples, so a gap that is
                 # simply skipped shifts every later sample earlier and audio
                 # slides ahead of video. Filling the gap keeps them aligned.

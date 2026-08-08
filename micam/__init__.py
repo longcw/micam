@@ -28,12 +28,17 @@ AUDIO_INPUTS = {
 # so a little jitter or a dropped frame cannot shift the answer.
 AUDIO_RATES = (8000, 16000)
 
-# Frames to discard before timing, so the burst the server flushes on connect is not
-# mistaken for the camera's pace, and frames to time afterwards. Counting frames rather
-# than watching a clock means a stall lengthens the measurement instead of corrupting
-# it. At 25 frames a second these cost roughly three seconds.
-AUDIO_RATE_SKIP_FRAMES = 15
-AUDIO_RATE_SAMPLE_FRAMES = 60
+# Frames arriving closer together than this came from the server's buffer rather than
+# the camera, and are ignored. Real frames are 40 ms apart at 16 kHz and 80 ms at
+# 8 kHz, while buffered ones arrive in about a millisecond, so the two are far apart
+# and the exact threshold does not matter.
+AUDIO_BURST_GAP = 0.005
+
+# Frames to time once the burst is out of the way, and the longest we will spend
+# gathering them before going with what we have. At 25 frames a second the sample is
+# about two seconds.
+AUDIO_RATE_SAMPLE_FRAMES = 50
+AUDIO_RATE_MEASURE_TIMEOUT = 15.0
 
 # How far the measurement may sit from the rate we pick before it is worth warning
 # about. Anything larger means the stream is not behaving like either candidate.
@@ -244,12 +249,14 @@ class RTSPBridge:
         dies, because it drains half as fast as the camera fills it.
         """
         loop = asyncio.get_running_loop()
-        seen = 0
         prev: Optional[float] = None
         gaps: list[float] = []
         sizes: list[int] = []
+        give_up = loop.time() + AUDIO_RATE_MEASURE_TIMEOUT
         try:
             while len(gaps) < AUDIO_RATE_SAMPLE_FRAMES:
+                if loop.time() > give_up:
+                    break
                 msg = await asyncio.wait_for(ws.receive(), timeout=AUDIO_CODEC_TIMEOUT)
                 if msg.type != aiohttp.WSMsgType.BINARY:
                     if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING,
@@ -257,16 +264,18 @@ class RTSPBridge:
                         logger.warning("Audio WebSocket closed while measuring its rate")
                         return None
                     continue
-                seen += 1
-                # Whatever the server had buffered arrives in a burst on connect, far
-                # faster than real time; skip it rather than time it.
-                if seen <= AUDIO_RATE_SKIP_FRAMES:
-                    continue
                 now = loop.time()
-                if prev is not None:
-                    gaps.append(now - prev)
-                    sizes.append(len(msg.data))
+                gap = now - prev if prev is not None else None
                 prev = now
+                # Whatever the server had buffered arrives back to back on connect, so
+                # those frames say nothing about the camera's pace. How many there are
+                # varies, so recognise them by their spacing rather than counting a
+                # fixed number off: real frames are milliseconds apart, buffered ones
+                # microseconds.
+                if gap is None or gap < AUDIO_BURST_GAP:
+                    continue
+                gaps.append(gap)
+                sizes.append(len(msg.data))
         except asyncio.CancelledError:
             raise
         except Exception as e:

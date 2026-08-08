@@ -7,8 +7,8 @@ from micam import (
     AUDIO_GIVEUP_SECONDS,
     AUDIO_INPUTS,
     AUDIO_RATES,
+    AUDIO_BURST_GAP,
     AUDIO_RATE_SAMPLE_FRAMES,
-    AUDIO_RATE_SKIP_FRAMES,
     AUDIO_RECONNECT_DELAY,
     AUDIO_SILENCE,
     SHUTDOWN_TIMEOUT,
@@ -186,9 +186,10 @@ class RateDetectionTest(unittest.TestCase):
             got = min(AUDIO_RATES, key=lambda r: abs(r - measured))
             self.assertEqual(got, expected, f"{measured} -> {got}")
 
-    def test_connect_burst_is_skipped(self):
-        # the server flushes its buffer on connect much faster than real time
-        self.assertGreater(AUDIO_RATE_SKIP_FRAMES, 0)
+    def test_burst_threshold_separates_buffered_frames_from_real_ones(self):
+        # real frames are 40ms apart at 16kHz and 80ms at 8kHz; buffered ones ~1ms
+        self.assertLess(AUDIO_BURST_GAP, 0.040)
+        self.assertGreater(AUDIO_BURST_GAP, 0.002)
 
     def test_enough_frames_are_timed_for_a_median_to_mean_something(self):
         self.assertGreaterEqual(AUDIO_RATE_SAMPLE_FRAMES, 20)
@@ -198,8 +199,8 @@ class RateDetectionTest(unittest.TestCase):
         276 bytes/s, snapped to 8 kHz and halved the session's audio speed."""
 
         def measure(gaps, size=640):
-            gaps = sorted(gaps)
-            return size / gaps[len(gaps) // 2]
+            kept = sorted(g for g in gaps if g >= AUDIO_BURST_GAP)
+            return size / kept[len(kept) // 2]
 
         def snap(measured):
             return min(AUDIO_RATES, key=lambda r: abs(r - measured))
@@ -207,9 +208,13 @@ class RateDetectionTest(unittest.TestCase):
         cases = {
             "steady 16k": ([0.040] * 60, 16000),
             "steady 8k": ([0.080] * 60, 8000),
-            "16k after a connect burst": ([0.001] * 20 + [0.040] * 40, 16000),
             "16k with a stall": ([0.040] * 50 + [3.0] * 10, 16000),
-            "16k with both": ([0.001] * 15 + [0.040] * 35 + [3.0] * 10, 16000),
+            # the burst is unbounded: skipping a fixed count once left every timed
+            # frame still inside it, reading 744396 bytes/s
+            "16k behind a long burst": ([0.001] * 200 + [0.040] * 50, 16000),
+            "8k behind a long burst": ([0.001] * 500 + [0.080] * 50, 8000),
+            "16k with burst and stall": (
+                [0.001] * 100 + [0.040] * 40 + [3.0] * 10, 16000),
         }
         for name, (gaps, expected) in cases.items():
             self.assertEqual(snap(measure(gaps)), expected, name)

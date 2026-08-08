@@ -82,8 +82,7 @@ class StartFfmpegTest(unittest.TestCase):
         self.assertLess(cmd.index("pipe:0"), cmd.index("pipe:7"))
 
     def test_interleave_wait_is_disabled_when_audio_is_present(self):
-        # otherwise the muxer holds video until audio catches up, and audio
-        # arriving at exactly real time can never close a gap once one opens
+        # a live stream gains nothing from the muxer holding video back for audio
         cmd, _ = self.start(build_bridge(), audio_input(1027))
         self.assertEqual(cmd[cmd.index("-max_interleave_delta") + 1], "0")
 

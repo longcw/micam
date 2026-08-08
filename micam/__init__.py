@@ -66,6 +66,14 @@ AUDIO_SILENCE = {"alaw": b"\xd5", "mulaw": b"\xff"}
 # dead server from being hammered.
 AUDIO_RECONNECT_DELAY = 0.5
 
+# How often the pacer tops FFmpeg up. Short enough that FFmpeg always has audio in
+# hand, long enough not to spend the whole time waking up.
+AUDIO_PACE_INTERVAL = 0.02
+
+# A paced write should never block, since it matches what FFmpeg consumes; this only
+# catches FFmpeg having stopped reading entirely.
+AUDIO_WRITE_TIMEOUT = 10.0
+
 # Longest we wait for the audio task to stop during teardown. Exceeding it means a
 # worker thread is still stuck, and the bridge is better off exiting so the restart
 # policy can bring it back than hanging on forever.
@@ -108,9 +116,10 @@ class RTSPBridge:
         # set once the video loop is tearing down, so a shutting-down audio task
         # does not mistake an orderly stop for an audio failure
         self._shutting_down = False
-        # loop clock of the last audio frame written, used to size the silence
-        # that covers a reconnect gap
-        self._last_audio_at = 0.0
+        # audio waiting to be paced into FFmpeg, and the most we will hold before
+        # dropping the oldest to keep audio close behind video
+        self._audio_queue = bytearray()
+        self._audio_queue_max = 0
 
     async def _login(self) -> bool:
         """Login and retrieve access token."""
@@ -384,8 +393,14 @@ class RTSPBridge:
         while True:
             msg = await asyncio.wait_for(ws.receive(), timeout=60.0)
             if msg.type == aiohttp.WSMsgType.BINARY:
-                await asyncio.wait_for(self.audio_write(msg.data), timeout=30.0)
-                self._last_audio_at = asyncio.get_running_loop().time()
+                # Hand the frame to the pacer rather than to FFmpeg. Dropping the
+                # oldest audio when the queue runs long keeps the delay behind video
+                # bounded; the alternative is a backlog that grows all session.
+                self._audio_queue.extend(msg.data)
+                overflow = len(self._audio_queue) - self._audio_queue_max
+                if overflow > 0:
+                    del self._audio_queue[:overflow]
+                    logger.warning("Audio queue overran by %d bytes; dropped the oldest", overflow)
             elif msg.type == aiohttp.WSMsgType.TEXT:
                 # a codec change would need a different FFmpeg input, which a live
                 # session cannot be given, so stop rather than emit garbled audio
@@ -396,20 +411,57 @@ class RTSPBridge:
             elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED):
                 raise RuntimeError(f"audio websocket closed ({msg.type})")
 
-    async def _stream_audio(self, session, ws, audio_input):
-        """Keep audio flowing into FFmpeg, reconnecting as needed, while video runs.
+    async def _pace_audio(self, rate: int, silence: bytes):
+        """Feed FFmpeg exactly ``rate`` bytes a second, filling shortfalls with silence.
 
-        The server drops these sockets periodically. Tearing the whole bridge down
-        each time also killed a perfectly healthy video stream, so instead the
-        socket is reopened and the silence covering the gap is written, which keeps
-        audio lined up with video. Only a gap that cannot be closed within
-        AUDIO_GIVEUP_SECONDS restarts the bridge, because at that point the stream
-        is advertising an audio track it can no longer deliver.
+        FFmpeg times this input by counting samples, so it expects a steady stream and
+        stalls the whole mux when one does not arrive — which then backs up into the
+        video write and takes the bridge down. The websocket cannot promise steadiness:
+        it bursts on connect, trickles while reconnecting, and stops altogether when
+        the server drops it. Pacing here means FFmpeg never has to care, and audio
+        stays lined up with the wall clock that stamps video.
+        """
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        written = 0
+        while not self._shutting_down and self.audio_fd is not None:
+            await asyncio.sleep(AUDIO_PACE_INTERVAL)
+            # Derive what is owed from elapsed time rather than counting ticks, so a
+            # late wakeup is made up rather than accumulating into drift.
+            owed = int((loop.time() - start) * rate) - written
+            if owed <= 0:
+                continue
+            have = min(owed, len(self._audio_queue))
+            chunk = bytes(self._audio_queue[:have])
+            del self._audio_queue[:have]
+            if owed > have:
+                chunk += silence * (owed - have)
+            try:
+                await asyncio.wait_for(self.audio_write(chunk), timeout=AUDIO_WRITE_TIMEOUT)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error("Audio pacing stopped: %s", e)
+                return
+            written += owed
+
+    async def _stream_audio(self, session, ws, audio_input):
+        """Keep audio arriving for the pacer, reconnecting as needed, while video runs.
+
+        The server drops these sockets periodically. Tearing the whole bridge down each
+        time also killed a perfectly healthy video stream, so the socket is reopened
+        while the pacer covers the gap with silence. Only audio that stays away for
+        AUDIO_GIVEUP_SECONDS restarts the bridge, since by then the stream is
+        advertising a track it can no longer deliver.
         """
         await self.video_started.wait()
-        silence = AUDIO_SILENCE.get(audio_input[0], b"\xff")
-        rate = audio_input[1]
-        self._last_audio_at = asyncio.get_running_loop().time()
+        fmt, rate, _ = audio_input
+        silence = AUDIO_SILENCE.get(fmt, b"\xff")
+        self._audio_queue = bytearray()
+        # Hold at most a second of audio, so a burst cannot push audio a growing
+        # distance behind video.
+        self._audio_queue_max = rate
+        pacer = asyncio.create_task(self._pace_audio(rate, silence))
         down_since: Optional[float] = None
         try:
             while not self._shutting_down:
@@ -445,19 +497,13 @@ class RTSPBridge:
                                    reconnected, audio_input)
                     await ws.close()
                     return
-                # FFmpeg times this input by counting samples, so a gap that is
-                # simply skipped shifts every later sample earlier and audio
-                # slides ahead of video. Filling the gap keeps them aligned.
-                gap = asyncio.get_running_loop().time() - self._last_audio_at
-                padded = min(gap, AUDIO_GIVEUP_SECONDS)
-                if padded > 0:
-                    await self.audio_write(silence * int(padded * rate))
-                    logger.info("Audio resumed; padded %.1fs of silence", padded)
-                self._last_audio_at = asyncio.get_running_loop().time()
+                logger.info("Audio resumed after %.1fs", asyncio.get_running_loop().time() - down_since)
                 down_since = None
         except asyncio.CancelledError:
             raise
         finally:
+            pacer.cancel()
+            await asyncio.gather(pacer, return_exceptions=True)
             if ws is not None and not ws.closed:
                 await ws.close()
             self._close_audio_fd()

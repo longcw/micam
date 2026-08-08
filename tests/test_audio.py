@@ -7,6 +7,7 @@ from micam import (
     AUDIO_GIVEUP_SECONDS,
     AUDIO_INPUTS,
     AUDIO_RATES,
+    AUDIO_PACE_INTERVAL,
     AUDIO_BURST_GAP,
     AUDIO_GAP_MAX,
     AUDIO_GAP_MIN,
@@ -285,6 +286,58 @@ class CadencePlausibilityTest(unittest.TestCase):
         for gap in (0.040, 0.080):
             self.assertLessEqual(AUDIO_GAP_MIN, gap)
             self.assertGreaterEqual(AUDIO_GAP_MAX, gap)
+
+
+class PacerTest(unittest.TestCase):
+    """FFmpeg expects a steady stream and stalls the whole mux without one, which
+    backs up into the video write and takes the bridge down. The websocket cannot
+    promise steadiness, so the pacer supplies it."""
+
+    RATE = 16000
+
+    def run_pacer(self, supply, ticks=250):
+        """Mirror of _pace_audio's arithmetic, with deliberately late wakeups."""
+        queue = bytearray()
+        written = silence = 0
+        now = 0.0
+        for i in range(ticks):
+            now += AUDIO_PACE_INTERVAL * (1.6 if i % 37 == 0 else 1.0)
+            queue.extend(supply(i))
+            overflow = len(queue) - self.RATE
+            if overflow > 0:
+                del queue[:overflow]
+            owed = int(now * self.RATE) - written
+            if owed <= 0:
+                continue
+            have = min(owed, len(queue))
+            del queue[:have]
+            silence += owed - have
+            written += owed
+        return written, silence, now
+
+    def assert_exact(self, supply):
+        written, silence, now = self.run_pacer(supply)
+        self.assertEqual(written, int(now * self.RATE))
+        return silence
+
+    def test_output_matches_the_declared_rate_whatever_arrives(self):
+        # late wakeups are made up rather than accumulating into drift
+        self.assert_exact(lambda i: b"x" * 320)
+        self.assert_exact(lambda i: b"")
+        self.assert_exact(lambda i: b"x" * 20000 if i == 0 else b"x" * 320)
+
+    def test_a_dropout_becomes_silence_of_the_same_length(self):
+        silence = self.assert_exact(lambda i: b"" if 50 < i < 110 else b"x" * 320)
+        # 60 ticks of 20ms is about 1.2s
+        self.assertAlmostEqual(silence / self.RATE, 1.2, delta=0.2)
+
+    def test_silence_covers_the_whole_run_when_nothing_arrives(self):
+        silence = self.assert_exact(lambda i: b"")
+        self.assertGreater(silence, 0)
+
+    def test_a_burst_is_spent_rather_than_dropped(self):
+        self.assertEqual(
+            self.assert_exact(lambda i: b"x" * 20000 if i == 0 else b"x" * 320), 0)
 
 
 if __name__ == "__main__":

@@ -80,9 +80,10 @@ AUDIO_QUEUE_TARGET_SECONDS = 0.15
 # How often to mention trimming. Per-frame warnings buried every other log line.
 AUDIO_DROP_REPORT_INTERVAL = 30.0
 
-# A paced write should never block, since it matches what FFmpeg consumes; this only
-# catches FFmpeg having stopped reading entirely.
-AUDIO_WRITE_TIMEOUT = 10.0
+# A paced write should never block, since it matches what FFmpeg consumes, so a wait
+# this long already means FFmpeg has stopped reading and the bridge needs restarting.
+# Waiting longer only delays that.
+AUDIO_WRITE_TIMEOUT = 3.0
 
 # Longest we wait for the audio task to stop during teardown. Exceeding it means a
 # worker thread is still stuck, and the bridge is better off exiting so the restart
@@ -448,7 +449,14 @@ class RTSPBridge:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.error("Audio pacing stopped: %s", e)
+                # A paced write matches what FFmpeg consumes, so it only blocks when
+                # FFmpeg has stopped reading. Simply returning left audio stopped for
+                # good and guaranteed the starvation that followed 33 seconds later.
+                # Bring FFmpeg down instead, so the bridge restarts straight away
+                # rather than limping to the video write's own timeout.
+                logger.error("FFmpeg stopped accepting audio (%s); restarting the bridge",
+                             type(e).__name__)
+                self._terminate_ffmpeg()
                 return
             written += owed
 

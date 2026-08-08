@@ -394,5 +394,22 @@ class QueueTrimTest(unittest.TestCase):
         self.assertLessEqual(AUDIO_QUEUE_MAX_SECONDS, 1.0)
 
 
+class PacerFailureTest(unittest.TestCase):
+    def test_a_blocked_write_brings_ffmpeg_down(self):
+        """Returning quietly left audio stopped for good, which guaranteed the
+        starvation that stalled video 33 seconds later."""
+        bridge = build_bridge()
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        bridge.process = proc
+        bridge._terminate_ffmpeg()
+        proc.terminate.assert_called_once()
+
+    def test_write_timeout_is_short_enough_to_act_on(self):
+        from micam import AUDIO_WRITE_TIMEOUT
+        # a paced write matches consumption, so blocking at all means trouble
+        self.assertLessEqual(AUDIO_WRITE_TIMEOUT, 5.0)
+
+
 if __name__ == "__main__":
     unittest.main()

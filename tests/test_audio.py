@@ -3,7 +3,13 @@ import os
 import unittest
 from unittest import mock
 
-from micam import AUDIO_GIVEUP_SECONDS, AUDIO_INPUTS, AUDIO_SILENCE, RTSPBridge
+from micam import (
+    AUDIO_GIVEUP_SECONDS,
+    AUDIO_INPUTS,
+    AUDIO_RECONNECT_DELAY,
+    AUDIO_SILENCE,
+    RTSPBridge,
+)
 
 
 def build_bridge(**kwargs):
@@ -137,6 +143,11 @@ class SilencePaddingTest(unittest.TestCase):
     def test_one_second_of_padding_is_one_second_of_samples(self):
         fmt, rate, _ = AUDIO_INPUTS[1027]
         self.assertEqual(len(AUDIO_SILENCE[fmt] * int(1.0 * rate)), 8000)
+
+    def test_reconnect_delay_stays_short(self):
+        # the delay becomes silence in the recording, and drops come every couple
+        # of minutes, so a slow reconnect costs real audio
+        self.assertLessEqual(AUDIO_RECONNECT_DELAY, 1.0)
 
     def test_giveup_is_long_enough_to_ride_out_a_drop(self):
         # the server drops these sockets every 40-90s; giving up sooner would put

@@ -29,10 +29,14 @@ AUDIO_CODEC_TIMEOUT = 10.0
 # the audio clock keeps pace with wall clock across a reconnect.
 AUDIO_SILENCE = {"alaw": b"\xd5", "mulaw": b"\xff"}
 
-# Pause before reopening a dropped audio socket, and how long audio may stay
-# down before the bridge restarts rather than keep advertising a track it
-# cannot deliver.
-AUDIO_RECONNECT_DELAY = 2.0
+# Pause before reopening a dropped audio socket. Every second spent here becomes
+# silence in the recording, and the server drops the socket often enough for that
+# to add up, so keep it short; the give-up timer below is what stops a genuinely
+# dead server from being hammered.
+AUDIO_RECONNECT_DELAY = 0.5
+
+# How long audio may stay down before the bridge restarts rather than keep
+# advertising a track it cannot deliver.
 AUDIO_GIVEUP_SECONDS = 60.0
 
 

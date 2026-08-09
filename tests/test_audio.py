@@ -73,6 +73,19 @@ class StartFfmpegTest(unittest.TestCase):
         cmd, _ = self.start(build_bridge(), audio_input(1026))
         self.assertIn("mulaw", cmd)
 
+    def test_opus_arrives_as_ogg_and_is_copied(self):
+        cmd, _ = self.start(build_bridge(), audio_input(1032, rate=48000))
+        self.assertEqual(cmd.count("-i"), 2)
+        self.assertIn("ogg", cmd)
+        self.assertEqual(cmd[cmd.index("-c:a") + 1], "copy")
+        self.assertIn("1:a", cmd)
+
+    def test_ogg_declares_its_own_rate_and_channels(self):
+        # -ar/-ac would override what the Ogg header already states
+        cmd, _ = self.start(build_bridge(), audio_input(1032, rate=48000))
+        self.assertNotIn("-ar", cmd)
+        self.assertNotIn("-ac", cmd)
+
     def test_video_input_precedes_audio_input(self):
         cmd, _ = self.start(build_bridge(), audio_input(1027))
         # -map 0:v / -map 1:a rely on this order
@@ -95,8 +108,7 @@ class StartFfmpegTest(unittest.TestCase):
 
 
 class AudioInputTableTest(unittest.TestCase):
-    def test_opus_and_pcm_are_not_muxed_yet(self):
-        self.assertNotIn(1032, AUDIO_INPUTS)
+    def test_pcm_is_not_muxed_yet(self):
         self.assertNotIn(1024, AUDIO_INPUTS)
 
     def test_g711_pair_is_eight_kilohertz_mono(self):
@@ -155,10 +167,12 @@ class AudioFailureTest(unittest.TestCase):
 
 
 class SilencePaddingTest(unittest.TestCase):
-    def test_every_muxable_codec_has_a_silence_byte(self):
-        # a reconnect pads the gap with silence, so each format we can mux needs one
+    def test_every_raw_codec_has_a_silence_byte(self):
+        # a reconnect pads the gap with silence, so each raw format needs one; Ogg
+        # pads with silent frames instead, which OggOpusWriter builds for itself
         for fmt, _ in AUDIO_INPUTS.values():
-            self.assertIn(fmt, AUDIO_SILENCE)
+            if fmt != "ogg":
+                self.assertIn(fmt, AUDIO_SILENCE)
 
     def test_silence_bytes_match_the_encodings(self):
         self.assertEqual(AUDIO_SILENCE["alaw"], b"\xd5")

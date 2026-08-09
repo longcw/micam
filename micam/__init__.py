@@ -7,6 +7,8 @@ import logging
 import subprocess
 from typing import Optional, Tuple
 
+from .opus import OPUS_RATE, OggOpusWriter
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -15,13 +17,14 @@ logger = logging.getLogger(__name__)
 AUDIO_CODEC_NAMES = {1024: 'PCM', 1026: 'G711U', 1027: 'G711A', 1032: 'OPUS'}
 
 # codec id -> (ffmpeg input format, channels). Cameras send bare frames with no
-# container, so the format has to be declared rather than probed. The sample rate is
-# measured instead of listed here, because the codec id does not carry it and cameras
-# run G.711 at either 8 or 16 kHz. Opus is absent on purpose: its frames need Ogg or
-# RTP framing before FFmpeg will accept them.
+# container, so the format has to be declared rather than probed. G.711's sample rate
+# is measured instead of listed here, because the codec id does not carry it and
+# cameras run it at either 8 or 16 kHz. Opus frames are wrapped in Ogg on the way to
+# FFmpeg, which declares both rate and channels itself, so neither is listed.
 AUDIO_INPUTS = {
     1026: ('mulaw', 1),
     1027: ('alaw', 1),
+    1032: ('ogg', 0),
 }
 
 # Sample rates G.711 cameras use. The measured byte rate is snapped to the nearest,
@@ -117,6 +120,8 @@ class RTSPBridge:
         self._audio_silence: Optional[bytes] = None
         self._audio_rate: Optional[int] = None
         self._audio_gap_start: Optional[float] = None
+        # set for the life of an Opus session, which is framed as Ogg on the way out
+        self._ogg: Optional[OggOpusWriter] = None
 
     async def _login(self) -> bool:
         """Login and retrieve access token."""
@@ -171,14 +176,14 @@ class RTSPBridge:
             read_fd, write_fd = os.pipe()
             self.audio_fd = write_fd
             pass_fds = (read_fd,)
-            # no wallclock stamping here: raw PCM carries its own timing through the sample
-            # rate, and stamping by arrival bunches bursts into too short a span
-            ffmpeg_cmd += [
-                '-f', audio_format,
-                '-ar', str(sample_rate),
-                '-ac', str(channels),
-                '-i', f'pipe:{read_fd}',
-            ]
+            # no wallclock stamping here: the audio carries its own timing, through the
+            # sample rate for raw PCM and granule positions for Ogg, and stamping by
+            # arrival bunches bursts into too short a span
+            ffmpeg_cmd += ['-f', audio_format]
+            if audio_format != 'ogg':
+                # Ogg announces rate and channels in its own header; raw PCM cannot.
+                ffmpeg_cmd += ['-ar', str(sample_rate), '-ac', str(channels)]
+            ffmpeg_cmd += ['-i', f'pipe:{read_fd}']
 
         if audio_input:
             # Write packets as they arrive rather than buffering to interleave them.
@@ -356,7 +361,12 @@ class RTSPBridge:
                 audio_input = AUDIO_INPUTS.get(codec_id)
                 if audio_input:
                     fmt, channels = audio_input
-                    rate = known_rate or await self._measure_rate(ws)
+                    if fmt == 'ogg':
+                        # nothing to measure: Opus states its own frame duration packet
+                        # by packet, and always decodes on a 48 kHz clock
+                        rate = OPUS_RATE
+                    else:
+                        rate = known_rate or await self._measure_rate(ws)
                     if rate is None:
                         break
                     logger.info(
@@ -400,7 +410,8 @@ class RTSPBridge:
                     if self._audio_gap_start is not None:
                         await self._fill_gap(now - self._audio_gap_start)
                         self._audio_gap_start = None
-                await asyncio.wait_for(self.audio_write(msg.data), timeout=AUDIO_WRITE_TIMEOUT)
+                data = self._ogg.wrap(msg.data) if self._ogg else msg.data
+                await asyncio.wait_for(self.audio_write(data), timeout=AUDIO_WRITE_TIMEOUT)
             elif msg.type == aiohttp.WSMsgType.TEXT:
                 # a codec change would need a different FFmpeg input, which a live
                 # session cannot be given, so stop rather than emit garbled audio
@@ -418,12 +429,18 @@ class RTSPBridge:
         later sample earlier and slides audio ahead of video for good.
         """
         seconds = min(seconds, AUDIO_GIVEUP_SECONDS)
-        if seconds <= 0 or not self._audio_silence or not self._audio_rate:
+        if seconds <= 0:
+            return
+        if self._ogg:
+            filler = self._ogg.silence(seconds)
+        elif self._audio_silence and self._audio_rate:
+            filler = self._audio_silence * int(seconds * self._audio_rate)
+        else:
+            filler = b""
+        if not filler:
             return
         logger.info("Audio resumed; filling %.1fs of silence", seconds)
-        await asyncio.wait_for(
-            self.audio_write(self._audio_silence * int(seconds * self._audio_rate)),
-            timeout=AUDIO_WRITE_TIMEOUT)
+        await asyncio.wait_for(self.audio_write(filler), timeout=AUDIO_WRITE_TIMEOUT)
 
     async def _stream_audio(self, session, ws, audio_input):
         """Feed FFmpeg audio, reconnecting as needed, while video keeps running.
@@ -436,6 +453,7 @@ class RTSPBridge:
         """
         await self.video_started.wait()
         fmt, rate, _ = audio_input
+        self._ogg = OggOpusWriter() if fmt == 'ogg' else None
         self._audio_silence = AUDIO_SILENCE.get(fmt, b"\xff")
         self._audio_rate = rate
         self._audio_gap_start = None

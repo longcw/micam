@@ -326,13 +326,16 @@ class RTSPBridge:
         return rate
 
     async def _open_audio(
-        self, session, known_rate: Optional[int] = None
+        self, session, known_rate: Optional[int] = None, hold_on_timeout: bool = False
     ) -> Tuple[Optional[object], Optional[Tuple[str, int, int]]]:
         """Connect the audio stream and wait for the codec the camera is sending.
 
         ``known_rate`` skips the measurement on a reconnect: FFmpeg is already
         running with that rate on its input and cannot be retuned mid-session, so
         measuring again would only add silence to the gap.
+
+        ``hold_on_timeout`` returns the socket with no codec rather than closing
+        it, leaving the caller free to keep listening.
         """
         ws_url = self._ws_url("audio_stream")
         logger.info(f"Connecting to audio WebSocket: {ws_url}")
@@ -347,8 +350,7 @@ class RTSPBridge:
             while True:
                 timeout = deadline - asyncio.get_running_loop().time()
                 if timeout <= 0:
-                    logger.warning("No audio codec announced, continuing without audio")
-                    break
+                    raise asyncio.TimeoutError
                 msg = await asyncio.wait_for(ws.receive(), timeout=timeout)
                 if msg.type != aiohttp.WSMsgType.TEXT:
                     if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING,
@@ -376,12 +378,48 @@ class RTSPBridge:
                     "Audio codec %s(%s) is not supported yet, continuing without audio", codec_name, codec_id)
                 break
         except asyncio.TimeoutError:
+            # The codec comes off the camera's first audio frame, and a cold stream
+            # can take minutes to send one, so a longer wait here would only delay
+            # video. Hold the socket instead and let the caller act when it arrives.
+            if hold_on_timeout:
+                logger.warning("No audio codec yet; publishing video-only and still listening")
+                return ws, None
             logger.warning("Timed out waiting for the audio codec, continuing without audio")
         except Exception as e:
             logger.warning("Audio setup failed, continuing without it: %s", e)
 
         await ws.close()
         return None, None
+
+    async def _watch_late_audio(self, ws) -> None:
+        """Restart the bridge if the codec turns up once video-only is running.
+
+        FFmpeg's inputs are fixed for the life of the process, so audio cannot join
+        this session. The next one gets it announced immediately, because by then
+        the camera is sending frames and the server has the codec cached.
+        """
+        try:
+            while True:
+                msg = await ws.receive()
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    codec_id = json.loads(msg.data).get("codec_id")
+                    codec_name = AUDIO_CODEC_NAMES.get(codec_id, "unknown")
+                    if codec_id in AUDIO_INPUTS:
+                        logger.error("Audio codec %s(%s) arrived late; restarting the bridge",
+                                     codec_name, codec_id)
+                        self._terminate_ffmpeg()
+                    else:
+                        logger.warning("Late audio codec %s(%s) is not supported, staying video-only",
+                                       codec_name, codec_id)
+                    return
+                if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING,
+                                aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    logger.warning("Audio WebSocket closed before announcing a codec")
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("Gave up waiting for a late audio codec: %s", e)
 
     async def _drain_audio(self, ws) -> None:
         """Pipe frames from one audio websocket into FFmpeg until it ends.
@@ -521,14 +559,16 @@ class RTSPBridge:
             audio_ws = None
             audio_input = None
             if self.enable_audio:
-                audio_ws, audio_input = await self._open_audio(session)
+                audio_ws, audio_input = await self._open_audio(session, hold_on_timeout=True)
 
             self._start_ffmpeg(audio_input)
-            audio_task = (
-                asyncio.create_task(self._stream_audio(session, audio_ws, audio_input))
-                if audio_ws
-                else None
-            )
+            if audio_input:
+                audio_task = asyncio.create_task(
+                    self._stream_audio(session, audio_ws, audio_input))
+            elif audio_ws:
+                audio_task = asyncio.create_task(self._watch_late_audio(audio_ws))
+            else:
+                audio_task = None
 
             ws_url = self._ws_url("video_stream")
             logger.info(f"Connecting to WebSocket: {ws_url}")

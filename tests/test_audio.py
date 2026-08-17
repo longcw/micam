@@ -1,7 +1,12 @@
 """Tests for audio codec selection and the FFmpeg command it produces."""
+import asyncio
+import json
 import os
 import unittest
+from types import SimpleNamespace
 from unittest import mock
+
+import aiohttp
 
 from micam import (
     AUDIO_GIVEUP_SECONDS,
@@ -335,6 +340,87 @@ class BackpressureTest(unittest.TestCase):
         rate = 16000
         for gap in (0.5, 2.0, 5.0):
             self.assertEqual(len(AUDIO_SILENCE["alaw"] * int(gap * rate)), int(gap * rate))
+
+
+class FakeWebSocket:
+    """Hands out queued messages, then blocks the way a live socket does."""
+
+    def __init__(self, messages=()):
+        self.messages = list(messages)
+        self.closed = False
+
+    async def receive(self):
+        if self.messages:
+            return self.messages.pop(0)
+        await asyncio.sleep(3600)
+
+    async def close(self):
+        self.closed = True
+
+
+class FakeSession:
+    def __init__(self, ws):
+        self.ws = ws
+
+    async def ws_connect(self, url, ssl=None):
+        return self.ws
+
+
+def text_frame(codec_id):
+    return SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data=json.dumps({"codec_id": codec_id}))
+
+
+class LateCodecTest(unittest.IsolatedAsyncioTestCase):
+    """The failure that shipped: one reconnect that found no codec within the wait
+    published video-only for 47 hours, because the socket was dropped and the
+    decision never revisited. Miloco only announces the codec once the camera's
+    first audio frame arrives, and a cold stream takes far longer than the wait --
+    every success observed was an instant cache hit, so waiting longer buys
+    nothing and only the next session can pick the audio up."""
+
+    async def test_a_late_codec_keeps_the_socket_at_startup(self):
+        ws = FakeWebSocket()
+        with mock.patch("micam.AUDIO_CODEC_TIMEOUT", 0.05):
+            got_ws, audio_input = await build_bridge()._open_audio(
+                FakeSession(ws), hold_on_timeout=True)
+        self.assertIs(got_ws, ws)
+        self.assertIsNone(audio_input)
+        self.assertFalse(ws.closed)
+
+    async def test_a_mid_session_reconnect_still_gives_up(self):
+        # that path has its own retry loop and gap filling, so holding the socket
+        # there would trade a covered gap for a bridge restart
+        ws = FakeWebSocket()
+        with mock.patch("micam.AUDIO_CODEC_TIMEOUT", 0.05):
+            got_ws, audio_input = await build_bridge()._open_audio(FakeSession(ws))
+        self.assertIsNone(got_ws)
+        self.assertIsNone(audio_input)
+        self.assertTrue(ws.closed)
+
+    async def test_a_codec_that_turns_up_late_restarts_the_bridge(self):
+        bridge = build_bridge()
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        bridge.process = proc
+        await bridge._watch_late_audio(FakeWebSocket([text_frame(1032)]))
+        proc.terminate.assert_called_once()
+
+    async def test_an_unsupported_late_codec_leaves_the_session_alone(self):
+        bridge = build_bridge()
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        bridge.process = proc
+        await bridge._watch_late_audio(FakeWebSocket([text_frame(1024)]))
+        proc.terminate.assert_not_called()
+
+    async def test_a_closed_socket_leaves_the_session_alone(self):
+        bridge = build_bridge()
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        bridge.process = proc
+        closed = SimpleNamespace(type=aiohttp.WSMsgType.CLOSED, data=None)
+        await bridge._watch_late_audio(FakeWebSocket([closed]))
+        proc.terminate.assert_not_called()
 
 
 if __name__ == "__main__":

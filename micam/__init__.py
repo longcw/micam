@@ -89,12 +89,21 @@ STDERR_READ_TIMEOUT = 5.0
 # advertising a track it cannot deliver.
 AUDIO_GIVEUP_SECONDS = 60.0
 
+# Longest the video socket may sit idle before the bridge gives up on the session.
+VIDEO_RECEIVE_TIMEOUT = 60.0
+
+# Longest a single write into FFmpeg may block. Exceeding it means FFmpeg stopped
+# reading, and the bridge reports FFmpeg's own stderr on the way out.
+VIDEO_WRITE_TIMEOUT = 30.0
+
 # Longest video may go without reaching FFmpeg before the watchdog gives up on the
 # session. Every other deadline here watches a socket or a pipe, so a bridge that is
 # alive and publishing nothing satisfies all of them: the process never exits, the
 # restart policy never fires, and the stream stays dead until someone restarts it by
-# hand. This is the only check on progress itself.
-PUBLISH_STALL_TIMEOUT = 20.0
+# hand. This is the only check on progress itself. It sits above both of those, so
+# the bridge's own handling runs first and gets to say why FFmpeg stopped reading,
+# which a stack dump cannot; the watchdog is for the freeze where nothing fires.
+PUBLISH_STALL_TIMEOUT = 75.0
 
 # How often the watchdog compares that stamp against the clock. It only has to be
 # short relative to the timeout above, since a stall is already several seconds old
@@ -604,7 +613,8 @@ class RTSPBridge:
 
                     while True:
                         try:
-                            msg = await asyncio.wait_for(ws.receive(), timeout=60.0)
+                            msg = await asyncio.wait_for(
+                                ws.receive(), timeout=VIDEO_RECEIVE_TIMEOUT)
                         except asyncio.TimeoutError:
                             logger.error("Data received timeout. Exiting.")
                             break
@@ -623,7 +633,8 @@ class RTSPBridge:
                                     else:
                                         logger.debug("Skipping non-keyframe data...")
                                         continue
-                                await asyncio.wait_for(self.process_write(msg.data), timeout=30.0)
+                                await asyncio.wait_for(
+                                    self.process_write(msg.data), timeout=VIDEO_WRITE_TIMEOUT)
                             except asyncio.TimeoutError:
                                 logger.error("Write data to process timeout.")
                                 await self.process_stderr()
@@ -800,9 +811,11 @@ def main():
         enable_audio=enable_audio,
     )
 
-    # dump every thread's stack on a fatal signal, and on demand, since `docker kill
-    # -s USR1` is the only way to see inside a bridge that has gone quiet without
-    # ending the session it is stuck in
+    # dump every thread's stack on a fatal signal, and on demand: `docker exec <name>
+    # kill -USR1 1` is how to see inside a bridge that has gone quiet without ending
+    # the session it is stuck in. Send it that way rather than with `docker kill`,
+    # which marks the container manually stopped whatever signal it carries and
+    # leaves dockerd refusing to apply the restart policy afterwards
     faulthandler.enable()
     faulthandler.register(signal.SIGUSR1)
     threading.Thread(target=bridge.watch_publishing, daemon=True).start()

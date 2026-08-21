@@ -2,7 +2,12 @@
 import unittest
 from unittest import mock
 
-from micam import PUBLISH_STALL_TIMEOUT, RTSPBridge
+from micam import (
+    PUBLISH_STALL_TIMEOUT,
+    VIDEO_RECEIVE_TIMEOUT,
+    VIDEO_WRITE_TIMEOUT,
+    RTSPBridge,
+)
 
 
 class Exited(Exception):
@@ -86,6 +91,12 @@ class WatchPublishingTest(unittest.TestCase):
         self.assertEqual(args, (1,))
         timer.return_value.start.assert_called_once_with()
         self.assertEqual(calls[0], ("dump", None))
+
+    def test_the_watchdog_sits_above_the_deadlines_in_the_video_loop(self):
+        # the loop's own handling must run first, because it reports FFmpeg's stderr
+        # and a stack dump cannot say why FFmpeg stopped reading
+        self.assertGreater(PUBLISH_STALL_TIMEOUT, VIDEO_RECEIVE_TIMEOUT)
+        self.assertGreater(PUBLISH_STALL_TIMEOUT, VIDEO_WRITE_TIMEOUT)
 
     def test_the_stack_dump_precedes_the_exit(self):
         bridge = build_bridge()

@@ -1,10 +1,14 @@
 import os
 import json
+import time
+import signal
 import asyncio
 import aiohttp
 import argparse
 import logging
+import threading
 import subprocess
+import faulthandler
 from typing import Optional, Tuple
 
 from .opus import OPUS_RATE, OggOpusWriter
@@ -85,6 +89,23 @@ STDERR_READ_TIMEOUT = 5.0
 # advertising a track it cannot deliver.
 AUDIO_GIVEUP_SECONDS = 60.0
 
+# Longest video may go without reaching FFmpeg before the watchdog gives up on the
+# session. Every other deadline here watches a socket or a pipe, so a bridge that is
+# alive and publishing nothing satisfies all of them: the process never exits, the
+# restart policy never fires, and the stream stays dead until someone restarts it by
+# hand. This is the only check on progress itself.
+PUBLISH_STALL_TIMEOUT = 20.0
+
+# How often the watchdog compares that stamp against the clock. It only has to be
+# short relative to the timeout above, since a stall is already several seconds old
+# by the time anything downstream notices.
+WATCHDOG_INTERVAL = 5.0
+
+# Grace for the stack dump to reach stderr before the process leaves anyway. A full
+# stderr pipe is itself one of the stalls this catches, so the exit cannot be allowed
+# to depend on the dump getting out.
+WATCHDOG_DUMP_GRACE = 2.0
+
 
 class RTSPBridge:
     def __init__(
@@ -122,6 +143,10 @@ class RTSPBridge:
         self._audio_gap_start: Optional[float] = None
         # set for the life of an Opus session, which is framed as Ogg on the way out
         self._ogg: Optional[OggOpusWriter] = None
+        # when video last reached FFmpeg, for the watchdog to measure against. None
+        # until the first write lands, so a slow start is left to the deadlines that
+        # already cover it rather than counted as a stall
+        self._last_write: Optional[float] = None
 
     async def _login(self) -> bool:
         """Login and retrieve access token."""
@@ -675,6 +700,7 @@ class RTSPBridge:
     def _process_write(self, data):
         self.process.stdin.write(data)
         self.process.stdin.flush()
+        self._last_write = time.monotonic()
 
     async def audio_write(self, data):
         if self.audio_fd is None:
@@ -710,6 +736,31 @@ class RTSPBridge:
         text = data.decode(errors="replace") if data else ""
         if text.strip():
             logger.error("FFmpeg stderr: %s", text.strip())
+
+    def watch_publishing(self):
+        """Exit the process once video stops reaching FFmpeg.
+
+        This runs on an OS thread rather than as a task, because the stall it
+        catches can freeze the event loop itself and a task would freeze with it.
+        The same freeze parks worker threads in writes that no cancellation can
+        interrupt, so ``os._exit`` is the only way out; the restart policy takes
+        it from there. The stacks go to stderr first, since a bridge that is alive
+        and silent leaves nothing else to diagnose it by.
+        """
+        while True:
+            time.sleep(WATCHDOG_INTERVAL)
+            last = self._last_write
+            if last is None or self._shutting_down:
+                continue
+            stalled = time.monotonic() - last
+            if stalled < PUBLISH_STALL_TIMEOUT:
+                continue
+            # arm the exit before writing anything, so a dump that blocks on a full
+            # stderr pipe cannot forfeit it
+            threading.Timer(WATCHDOG_DUMP_GRACE, os._exit, (1,)).start()
+            logger.error("No video reached FFmpeg for %.1fs; exiting to be restarted", stalled)
+            faulthandler.dump_traceback()
+            os._exit(1)
 
 
 def main():
@@ -748,6 +799,13 @@ def main():
         channel=args.channel or os.getenv("STREAM_CHANNEL", "0"),
         enable_audio=enable_audio,
     )
+
+    # dump every thread's stack on a fatal signal, and on demand, since `docker kill
+    # -s USR1` is the only way to see inside a bridge that has gone quiet without
+    # ending the session it is stuck in
+    faulthandler.enable()
+    faulthandler.register(signal.SIGUSR1)
+    threading.Thread(target=bridge.watch_publishing, daemon=True).start()
 
     try:
         asyncio.run(bridge.run())

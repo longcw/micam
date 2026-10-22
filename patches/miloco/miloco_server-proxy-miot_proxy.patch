@@ -1,15 +1,36 @@
 --- a/miloco_server/proxy/miot_proxy.py
 +++ b/miloco_server/proxy/miot_proxy.py
-@@ -172,6 +172,37 @@
+@@ -34,6 +34,8 @@
+         self._kv_dao = kv_dao
+         self.init_miot_info_dict()
+         self._camera_img_managers: dict[str, CameraVisionHandler] = {}
++        # one refresh at a time, or concurrent callers each open a P2P session to the same camera
++        self._refresh_cameras_lock = asyncio.Lock()
+         self._token_refresh_task: Optional[asyncio.Task] = None
+ 
+         self._miot_client = MIoTClient(
+@@ -143,10 +145,9 @@
+ 
+     async def start_camera_raw_stream(self, camera_id: str, channel: int,
+                                     callback: Callable[[str, bytes, int, int, int], Coroutine]):
+-        if camera_id not in self._camera_img_managers:
+-            logger.warning("Camera %s not found in managers", camera_id)
++        instance = await self._get_or_create_camera_img_manager(camera_id)
++        if instance is None:
+             return
+-        instance = self._camera_img_managers[camera_id]
+         await instance.register_raw_stream(callback, channel)
+         logger.info("Successfully started camera raw stream, camera_id: %s, channel: %s", camera_id, channel)
+ 
+@@ -172,6 +173,47 @@
              raise
  
  
 +    async def start_camera_raw_audio_stream(self, camera_id: str, channel: int,
 +                                    callback: Callable[[str, bytes, int, int, int, int], Coroutine]):
-+        if camera_id not in self._camera_img_managers:
-+            logger.warning("Camera %s not found in managers", camera_id)
++        instance = await self._get_or_create_camera_img_manager(camera_id)
++        if instance is None:
 +            return
-+        instance = self._camera_img_managers[camera_id]
 +        await instance.register_raw_audio_stream(callback, channel)
 +        logger.info("Successfully started camera raw audio stream, camera_id: %s, channel: %s", camera_id, channel)
 +
@@ -35,6 +56,58 @@
 +            raise
 +
 +
++    async def _get_or_create_camera_img_manager(self, camera_id: str) -> CameraVisionHandler | None:
++        """Return the camera's manager, refreshing cameras first when an earlier refresh failed to build it."""
++        if camera_id not in self._camera_img_managers:
++            logger.warning("Camera %s not found in managers, refreshing cameras", camera_id)
++            await self.refresh_cameras()
++        if camera_id not in self._camera_img_managers:
++            logger.warning("Camera %s not found in managers", camera_id)
++            return None
++        return self._camera_img_managers[camera_id]
++
++
      async def _create_camera_img_manager(self, camera_info: MIoTCameraInfo) -> CameraVisionHandler | None:
          camera_instance = await self._get_camera_instance(camera_info)
          if camera_instance is not None:
+@@ -229,24 +271,25 @@
+ 
+     async def refresh_cameras(self) -> dict[str, MIoTCameraInfo] | None:
+         try:
+-            cameras = await self._miot_client.get_cameras_async()
+-            cameras = copy.deepcopy(cameras)
+-            for camera_did in cameras.keys():
+-                if camera_did not in self._camera_img_managers:
+-                    await self._create_camera_img_manager(cameras[camera_did])
+-                else:
+-                    await self._camera_img_managers[camera_did].update_camera_info(cameras[camera_did])
++            async with self._refresh_cameras_lock:
++                cameras = await self._miot_client.get_cameras_async()
++                cameras = copy.deepcopy(cameras)
++                for camera_did in cameras.keys():
++                    if camera_did not in self._camera_img_managers:
++                        await self._create_camera_img_manager(cameras[camera_did])
++                    else:
++                        await self._camera_img_managers[camera_did].update_camera_info(cameras[camera_did])
+ 
+-            for camera_did in list(self._camera_img_managers.keys()):
+-                if camera_did not in cameras:
+-                    await self._camera_img_managers[camera_did].destroy()
+-                    del self._camera_img_managers[camera_did]
+-            self._camera_info_dict = cameras
+-            self._kv_dao.set(DeviceInfoKeys.CAMERA_INFO_KEY, json.dumps(to_jsonable_python(cameras)))
+-            return cameras
++                for camera_did in list(self._camera_img_managers.keys()):
++                    if camera_did not in cameras:
++                        await self._camera_img_managers[camera_did].destroy()
++                        del self._camera_img_managers[camera_did]
++                self._camera_info_dict = cameras
++                self._kv_dao.set(DeviceInfoKeys.CAMERA_INFO_KEY, json.dumps(to_jsonable_python(cameras)))
++                return cameras
+ 
+         except Exception as e: # pylint: disable=broad-exception-caught
+-            logger.error("Failed to refresh cameras: %s", e)
++            logger.exception("Failed to refresh cameras: %r", e)
+             return None
+ 
+     async def refresh_devices(self) -> dict[str, MIoTDeviceInfo] | None:

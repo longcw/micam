@@ -1,0 +1,71 @@
+--- a/miot_kit/miot/spec.py
++++ b/miot_kit/miot/spec.py
+@@ -100,28 +100,21 @@
+         self._values = {}
+ 
+         self._spec_std_lib = None
++        self._refresh_task: Optional[asyncio.Task] = None
+ 
+     async def init_async(self) -> None:
+         """Init."""
+         std_lib_cache = await self._storage.load_async(domain=self._DOMAIN, name=self._NAME, type_=dict)
+-        if (
+-            isinstance(std_lib_cache, Dict)
+-            and "data" in std_lib_cache
+-            and "ts" in std_lib_cache
+-            and isinstance(std_lib_cache["ts"], int)
+-            and int(time.time()) - std_lib_cache["ts"] < SPEC_STD_LIB_EFFECTIVE_TIME
+-        ):
+-            # Use the cache if the update time is less than 14 day
+-            _LOGGER.debug("use local spec std cache, ts->%s", std_lib_cache["ts"])
++        if isinstance(std_lib_cache, Dict) and "data" in std_lib_cache:
+             self.__load(std_lib_cache["data"])
++            ts = std_lib_cache.get("ts")
++            if not isinstance(ts, int) or int(time.time()) - ts >= SPEC_STD_LIB_EFFECTIVE_TIME:
++                # a stale cache still serves every known device, so startup does not wait on the renewal
++                _LOGGER.info("spec std cache is stale, refreshing in the background, ts->%s", ts)
++                self._refresh_task = self._main_loop.create_task(self.refresh_async())
+             return
+-        # Update spec std lib
+         if not await self.refresh_async():
+-            if isinstance(std_lib_cache, Dict) and "data" in std_lib_cache:
+-                self.__load(std_lib_cache["data"])
+-                _LOGGER.info("get spec std lib failed, use local cache")
+-            else:
+-                _LOGGER.error("load spec std lib failed")
++            _LOGGER.error("load spec std lib failed")
+ 
+     async def deinit_async(self) -> None:
+         """Deinit."""
+@@ -865,6 +858,7 @@
+     def __init__(self, storage: MIoTStorage, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+         self._main_loop = loop or asyncio.get_running_loop()
+         self._storage = storage
++        self._refresh_task: Optional[asyncio.Task] = None
+ 
+     @property
+     def data(self) -> MIoTSpecType:
+@@ -874,17 +868,17 @@
+     async def init_async(self) -> None:
+         """Init."""
+         cache = await self._storage.load_async(domain=self._DOMAIN, name=self._NAME, type_=dict)
+-        if isinstance(cache, Dict) and int(time.time()) - cache.get("ts", 0) < SPEC_STD_LIB_EFFECTIVE_TIME:
++        if isinstance(cache, Dict) and "devices" in cache and "services" in cache:
+             self._data = MIoTSpecType.model_validate(obj=cache)
+             _LOGGER.info("load spec types from cache, %s", self._data.ts)
++            if int(time.time()) - cache.get("ts", 0) >= SPEC_STD_LIB_EFFECTIVE_TIME:
++                # a stale cache still serves every known device, so startup does not wait on the renewal
++                _LOGGER.info("spec types cache is stale, refreshing in the background")
++                self._refresh_task = self._main_loop.create_task(self.refresh_async())
+             return
+ 
+         if not await self.refresh_async():
+-            if isinstance(cache, Dict) and "devices" in cache and "services" in cache:
+-                self._data = MIoTSpecType.model_validate(obj=cache)
+-                _LOGGER.info("load spec types from cache failed, use cache, %s", self._data.ts)
+-            else:
+-                _LOGGER.error("load spec types failed")
++            _LOGGER.error("load spec types failed")
+ 
+     async def deinit_async(self) -> None:
+         """Deinit."""

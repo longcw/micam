@@ -80,6 +80,11 @@ docker compose up -d
    - `MILOCO_HOST`: Miloco listen host, Default: `0.0.0.0`, Don't change
    - `MILOCO_LOG_LEVEL`: Miloco log level, Default: `warning`
 
+3. Watchdog:
+   - `WATCH_STREAMS`: Comma separated go2rtc stream names to watch, e.g. `stream1,stream2`, Required
+     > 视频停止3分钟后让Miloco刷新摄像头，6分钟后重启Miloco一次（30分钟内最多一次）；重启后仍无视频则需给摄像头断电重启
+   - `GO2RTC_URL`: Go2rtc API URL, Default: `http://go2rtc:1984`
+
 
 ## 🧩 Integrations / 集成
 - [Home Assistant: Generic Camera](https://www.home-assistant.io/integrations/generic)

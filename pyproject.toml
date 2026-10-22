@@ -13,6 +13,7 @@ Repository = "https://github.com/miiot/micam"
 
 [project.scripts]
 micam = "micam:main"
+micam-watchdog = "micam.watchdog:main"
 
 [build-system]
 requires = ["hatchling"]

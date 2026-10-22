@@ -49,6 +49,27 @@ services:
     extra_hosts:
       - "miloco:${MILOCO_HOST_IP:-host-gateway}"
 
+  # Recovers streams that stop carrying video: a miloco camera refresh first, then
+  # one miloco restart. The socket is what lets it restart miloco.
+  watchdog:
+    image: ${MICAM_IMAGE:-ghcr.io/longcw/micam:main}
+    command: ["micam-watchdog"]
+    depends_on: [miloco, go2rtc]
+    environment:
+      # comma separated go2rtc stream names, e.g. stream1,stream2
+      WATCH_STREAMS: ${WATCH_STREAMS}
+      GO2RTC_URL: ${GO2RTC_URL:-http://go2rtc:1984}
+      MILOCO_BASE_URL: ${MILOCO_BASE_URL:-https://miloco:8000}
+      MILOCO_PASSWORD: ${MILOCO_PASSWORD}
+      MILOCO_CONTAINER: miloco
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: always
+    extra_hosts:
+      - "miloco:${MILOCO_HOST_IP:-host-gateway}"
+      - "go2rtc:${MILOCO_HOST_IP:-host-gateway}"
+
   # More Cameras ...
   micam2:
     <<: *micam

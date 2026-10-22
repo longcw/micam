@@ -25,6 +25,7 @@ jobs:
           echo "base image: $base"
           docker create --name miloco-base "$base"
           for f in miot_kit/miot/camera.py \
+                   miot_kit/miot/common.py \
                    miloco_server/controller/miot_controller.py \
                    miloco_server/service/miot_service.py \
                    miloco_server/proxy/miot_proxy.py \

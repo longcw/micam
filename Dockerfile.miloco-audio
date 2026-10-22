@@ -22,6 +22,7 @@ FROM alpine:3.20 AS patcher
 RUN apk add --no-cache patch
 
 COPY --from=source /app/miot_kit/miot/camera.py /work/miot_kit/miot/camera.py
+COPY --from=source /app/miot_kit/miot/common.py /work/miot_kit/miot/common.py
 COPY --from=source /app/miloco_server/controller/miot_controller.py /work/miloco_server/controller/miot_controller.py
 COPY --from=source /app/miloco_server/service/miot_service.py /work/miloco_server/service/miot_service.py
 COPY --from=source /app/miloco_server/proxy/miot_proxy.py /work/miloco_server/proxy/miot_proxy.py
@@ -44,6 +45,7 @@ RUN set -eux; \
 FROM ${MILOCO_BASE}
 
 COPY --from=patcher /work/miot_kit/miot/camera.py /app/miot_kit/miot/camera.py
+COPY --from=patcher /work/miot_kit/miot/common.py /app/miot_kit/miot/common.py
 COPY --from=patcher /work/miloco_server/controller/miot_controller.py /app/miloco_server/controller/miot_controller.py
 COPY --from=patcher /work/miloco_server/service/miot_service.py /app/miloco_server/service/miot_service.py
 COPY --from=patcher /work/miloco_server/proxy/miot_proxy.py /app/miloco_server/proxy/miot_proxy.py

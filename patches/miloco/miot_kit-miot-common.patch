@@ -1,0 +1,33 @@
+--- a/miot_kit/miot/common.py
++++ b/miot_kit/miot/common.py
+@@ -13,12 +13,19 @@
+ from typing import Dict, Optional
+ import hashlib
+ from urllib.parse import urlencode
++import weakref
+ from aiohttp import ClientSession, ClientTimeout
+ import yaml
+ 
+ MIOT_ROOT_PATH: str = path.dirname(path.abspath(__file__))
+ 
++# The spec loader fetches ~200 types at once; uncapped, that burst stalls every new
++# connection to Xiaomi's servers for 30 s, cloud API calls included.
++HTTP_GET_JSON_CONCURRENCY: int = 8
++_http_get_json_limits: "weakref.WeakKeyDictionary[AbstractEventLoop, asyncio.Semaphore]" = (
++    weakref.WeakKeyDictionary())
+ 
++
+ def gen_absolute_path(relative_path: str) -> str:
+     """Generate an absolute path."""
+     return path.join(MIOT_ROOT_PATH, relative_path)
+@@ -91,7 +98,9 @@
+         encoded_params = urlencode(params)
+         full_url = f"{url}?{encoded_params}"
+ 
+-    async with ClientSession(loop=loop) as session:
++    limit = _http_get_json_limits.setdefault(
++        asyncio.get_running_loop(), asyncio.Semaphore(HTTP_GET_JSON_CONCURRENCY))
++    async with limit, ClientSession(loop=loop) as session:
+         async with session.get(
+             url=full_url, headers=headers or {}, timeout=ClientTimeout(total=30)
+         ) as response:

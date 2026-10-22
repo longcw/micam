@@ -4,6 +4,7 @@ import time
 import asyncio
 import logging
 import argparse
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import aiohttp
@@ -21,6 +22,11 @@ REFRESH_AFTER = 180.0
 # Still no video this long and miloco is restarted. Every camera drops for about 2.5
 # minutes while it comes back, so this waits well past the bridges' own 60 s retry.
 RESTART_AFTER = 360.0
+
+# A miloco younger than this is still starting, or was just restarted by its own
+# policy after a crash; restarting it again only starts the wait over. A start that
+# renews the spec cache takes about 5 minutes.
+MILOCO_STARTUP_GRACE = 600.0
 
 # At most one restart per window across all streams, so a camera that a restart cannot
 # fix does not keep taking the healthy ones down with it.
@@ -59,7 +65,7 @@ class StreamWatchdog:
         self._gave_up: set = set()
         self._last_restart: Optional[float] = None
 
-    def observe(self, api_streams: dict, now: float) -> List[str]:
+    def observe(self, api_streams: dict, now: float, restart_allowed=True) -> List[str]:
         """Record one go2rtc snapshot and return the actions due: "refresh", "restart", or neither."""
         # record every stream's progress before acting, so a restart charged below
         # sees this round's state for the streams after it
@@ -86,7 +92,8 @@ class StreamWatchdog:
                             "%s still has no video after a miloco restart; the camera itself "
                             "likely needs a power-cycle", name)
                         self._gave_up.add(name)
-                elif self._last_restart is None or now - self._last_restart >= self.restart_cooldown:
+                elif restart_allowed and (
+                        self._last_restart is None or now - self._last_restart >= self.restart_cooldown):
                     logger.warning("%s has had no video for %.0fs; restarting miloco", name, idle)
                     actions.append("restart")
                     self._last_restart = now
@@ -115,17 +122,25 @@ async def refresh_cameras(session: aiohttp.ClientSession, base_url: str, usernam
         logger.info("Camera refresh: %s %s", resp.status, await resp.text())
 
 
-async def restart_container(socket_path: str, container: str):
+async def container_uptime(docker: aiohttp.ClientSession, container: str) -> float:
+    """Seconds since the container last started, through the Docker Engine API."""
+    async with docker.get(f"http://docker/containers/{container}/json") as resp:
+        resp.raise_for_status()
+        started_at = (await resp.json())["State"]["StartedAt"]
+    # docker reports nanoseconds, which fromisoformat cannot parse
+    started = datetime.fromisoformat(started_at[:19]).replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - started).total_seconds()
+
+
+async def restart_container(docker: aiohttp.ClientSession, container: str):
     """Restart a container through the Docker Engine API."""
-    connector = aiohttp.UnixConnector(path=socket_path)
-    async with aiohttp.ClientSession(connector=connector) as docker:
-        # the restart waits for the stop, so allow for the container's grace period
-        async with docker.post(
-            f"http://docker/containers/{container}/restart",
-            timeout=aiohttp.ClientTimeout(total=120),
-        ) as resp:
-            if resp.status != 204:
-                raise RuntimeError(f"restart {container} failed: {resp.status} {await resp.text()}")
+    # the restart waits for the stop, so allow for the container's grace period
+    async with docker.post(
+        f"http://docker/containers/{container}/restart",
+        timeout=aiohttp.ClientTimeout(total=120),
+    ) as resp:
+        if resp.status != 204:
+            raise RuntimeError(f"restart {container} failed: {resp.status} {await resp.text()}")
     logger.info("Restarted %s", container)
 
 
@@ -134,7 +149,9 @@ async def run(args):
     logger.info("Watching %s on %s", ", ".join(args.streams), args.go2rtc_url)
     # miloco's cookie is set on a bare IP or a hosts entry, which the default jar refuses
     jar = aiohttp.CookieJar(unsafe=True)
-    async with aiohttp.ClientSession(cookie_jar=jar, timeout=aiohttp.ClientTimeout(total=30)) as session:
+    docker_connector = aiohttp.UnixConnector(path=args.docker_socket)
+    async with aiohttp.ClientSession(cookie_jar=jar, timeout=aiohttp.ClientTimeout(total=30)) as session, \
+            aiohttp.ClientSession(connector=docker_connector, timeout=aiohttp.ClientTimeout(total=30)) as docker:
         while True:
             try:
                 async with session.get(f"{args.go2rtc_url}/api/streams") as resp:
@@ -144,13 +161,19 @@ async def run(args):
                 logger.warning("Cannot read go2rtc streams: %r", e)
                 api_streams = None
 
+            try:
+                restart_allowed = await container_uptime(docker, args.miloco_container) >= MILOCO_STARTUP_GRACE
+            except Exception as e:
+                logger.warning("Cannot inspect %s: %r", args.miloco_container, e)
+                restart_allowed = False
+
             if api_streams is not None:
-                for action in watchdog.observe(api_streams, time.monotonic()):
+                for action in watchdog.observe(api_streams, time.monotonic(), restart_allowed):
                     try:
                         if action == "refresh":
                             await refresh_cameras(session, args.base_url, args.username, args.password)
                         else:
-                            await restart_container(args.docker_socket, args.miloco_container)
+                            await restart_container(docker, args.miloco_container)
                     except Exception as e:
                         logger.error("%s failed: %r", action, e)
 

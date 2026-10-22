@@ -76,6 +76,11 @@ class StreamWatchdogTest(unittest.TestCase):
         self.assertEqual(self.dog.observe(snapshot(s1=7, s2=None), 760), [])
         self.assertEqual(self.dog.observe(snapshot(s1=8, s2=None), 2160), ["restart"])
 
+    def test_no_restart_while_miloco_is_starting(self):
+        self.dog.observe(snapshot(s1=None, s2=20), 180)
+        self.assertEqual(self.dog.observe(snapshot(s1=None, s2=30), 360, restart_allowed=False), [])
+        self.assertEqual(self.dog.observe(snapshot(s1=None, s2=40), 375, restart_allowed=True), ["restart"])
+
 
 if __name__ == "__main__":
     unittest.main()

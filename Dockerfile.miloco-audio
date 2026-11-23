@@ -28,6 +28,7 @@ COPY --from=source /app/miloco_server/controller/miot_controller.py /work/miloco
 COPY --from=source /app/miloco_server/service/miot_service.py /work/miloco_server/service/miot_service.py
 COPY --from=source /app/miloco_server/proxy/miot_proxy.py /work/miloco_server/proxy/miot_proxy.py
 COPY --from=source /app/miloco_server/utils/carmera_vision_handler.py /work/miloco_server/utils/carmera_vision_handler.py
+COPY --from=source /app/miloco_server/utils/normal_util.py /work/miloco_server/utils/normal_util.py
 
 COPY patches/miloco /patches
 
@@ -52,6 +53,7 @@ COPY --from=patcher /work/miloco_server/controller/miot_controller.py /app/miloc
 COPY --from=patcher /work/miloco_server/service/miot_service.py /app/miloco_server/service/miot_service.py
 COPY --from=patcher /work/miloco_server/proxy/miot_proxy.py /app/miloco_server/proxy/miot_proxy.py
 COPY --from=patcher /work/miloco_server/utils/carmera_vision_handler.py /app/miloco_server/utils/carmera_vision_handler.py
+COPY --from=patcher /work/miloco_server/utils/normal_util.py /app/miloco_server/utils/normal_util.py
 
 # drop bytecode cached from the unpatched sources
 RUN find /app/miot_kit /app/miloco_server -name '__pycache__' -type d -exec rm -rf {} + || true

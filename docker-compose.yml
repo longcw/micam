@@ -12,6 +12,8 @@ services:
       BACKEND_LOG_LEVEL: ${MILOCO_LOG_LEVEL:-warning}
       # comma separated models to accept despite the shipped denylist
       CAMERA_ALLOW_MODELS: ${CAMERA_ALLOW_MODELS:-}
+      CAMERA_VISION: ${CAMERA_VISION:-}
+      LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-7}
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
       - ./miloco:/app/miloco_server/.temp

@@ -1,0 +1,43 @@
+--- a/miloco_server/utils/normal_util.py
++++ b/miloco_server/utils/normal_util.py
+@@ -12,6 +12,7 @@
+ import logging
+ import os
+ import re
++import time
+ from pathlib import Path
+ from typing import List, Optional
+ 
+@@ -25,7 +26,10 @@
+ 
+ logger = logging.getLogger(name=__name__)
+ 
++# days of log files to keep; each start opens a new file and a long run rotates daily, so this caps the directory
++LOG_RETENTION_DAYS = max(1, int(os.getenv("LOG_RETENTION_DAYS", "7")))
+ 
++
+ def get_uvicorn_log_config(enable_file_logging: Optional[bool] = None,
+                            enable_console_logging: Optional[bool] = None):
+     """
+@@ -54,14 +58,19 @@
+         # Create log file
+         log_dir = str(LOG_DIR)
+         os.makedirs(log_dir, exist_ok=True)
++        cutoff = time.time() - LOG_RETENTION_DAYS * 86400
++        for entry in os.scandir(log_dir):
++            if entry.is_file() and ".log" in entry.name and entry.stat().st_mtime < cutoff:
++                os.remove(entry.path)
+         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+         service_name = APP_CONFIG["service_name"]
+         log_filename = os.path.join(log_dir, f"{service_name}_{timestamp}.log")
+ 
+         handlers["file"] = {
+-            "class": "logging.FileHandler",
++            "class": "logging.handlers.TimedRotatingFileHandler",
+             "filename": log_filename,
+-            "mode": "a",
++            "when": "midnight",
++            "backupCount": LOG_RETENTION_DAYS,
+             "formatter": "default",
+             "level": log_level,
+             "encoding": "utf-8"

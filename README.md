@@ -79,6 +79,10 @@ docker compose up -d
      > 如果与其他服务端口冲突，请修改此端口，并修改`MILOCO_BASE_URL`
    - `MILOCO_HOST`: Miloco listen host, Default: `0.0.0.0`, Don't change
    - `MILOCO_LOG_LEVEL`: Miloco log level, Default: `warning`
+   - `CAMERA_VISION`: Set to `1` to decode camera frames into JPEGs for Miloco's vision understanding, Default: off
+     > 开启后Miloco会持续软解每路摄像头的每一帧，约占一个CPU核心的一半；仅转推RTSP时无需开启
+   - `LOG_RETENTION_DAYS`: Days of Miloco log files to keep, Default: `7`
+     > 日志每天零点轮转，启动时删除超过该天数的旧日志，避免日志目录无限增长
 
 3. Watchdog:
    - `WATCH_STREAMS`: Comma separated go2rtc stream names to watch, e.g. `stream1,stream2`, Required
